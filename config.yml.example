@@ -1,0 +1,11 @@
+# QOS Auto-Filler configuration (example)
+# Use relative paths to keep it portable across systems.
+
+section: s1
+extractor_backend: pymupdf
+
+template_docx: ./inputs/Quality Overall Summary.docx
+dossier_root: ./inputs/Cardiolek
+filled_reference_docx: ./inputs/Quality Overall Summary_QOS.docx
+output_docx: ./outputs/Quality Overall Summary_QOS_2.3.S.1_Auto.docx
+artifacts_dir: ./artifacts
