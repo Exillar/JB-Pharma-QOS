@@ -1,11 +1,154 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import yaml
 
+
+# ---------------------------------------------------------------------------
+# Diagram extraction tuning
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class DiagramConfig:
+    """Controls how vector-drawn flow-diagram pages are detected and rendered.
+
+    All defaults reproduce the empirically-calibrated values for the Cardiolek
+    dossier.  Override in config.yaml under the ``diagram:`` key if a new
+    dossier has different header/footer heights or drawing densities.
+    """
+
+    # Sections whose diagrams are purely vector-drawn (no embedded XREFs).
+    # Every page in these sections that passes the heuristic is rendered.
+    vector_diagram_sections: tuple[str, ...] = ("3.2.S.2.2",)
+
+    # Sections where the page itself is rendered as a fallback when no
+    # embedded image XREF is found (e.g. structural-formula pages).
+    page_render_sections: tuple[str, ...] = ("3.2.S.1.2",)
+
+    # Minimum number of vector drawing paths required before a page is even
+    # considered as a diagram candidate.
+    min_diagram_drawings: int = 40
+
+    # If chars_per_drawing exceeds this, the page is mostly text (table with
+    # thin border lines counts as many "drawings" but is not a diagram).
+    chars_per_drawing_threshold: float = 30.0
+
+    # PyMuPDF Matrix scale factor applied when rendering a page to PNG.
+    # 2.0 → ~144 DPI at 72 DPI base; increase for higher resolution output.
+    render_dpi_scale: float = 2.0
+
+    # Fraction of page height to remove from the top (covers the dossier
+    # header table rows: company name, drug name, document title).
+    header_crop_frac: float = 0.135
+
+    # Fraction of page height to remove from the bottom (covers the footer:
+    # company line + "N of M" page number).
+    footer_crop_frac: float = 0.09
+
+    # Generic flow-diagram keywords used by the heuristic filter.  These are
+    # process-neutral terms; do NOT add compound-specific names here.
+    diagram_keywords: tuple[str, ...] = (
+        "flow diagram",
+        "stage",
+        "figure",
+        "filtration",
+        "crystallization",
+        "distillation",
+        "recrystallization",
+        "reduction",
+        "neutralization",
+        "polymerization",
+        "desalting",
+        "decoloration",
+    )
+
+    # Keywords that signal non-flow-diagram pages (e.g., chemical pathway pages).
+    diagram_exclude_keywords: tuple[str, ...] = (
+        "pathway",
+        "synthetic",
+        "synthetical",
+        "reaction scheme",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Noise / header-footer removal
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class NoiseConfig:
+    """Strings that appear as running headers/footers in dossier PDFs.
+
+    Add entries when a new dossier uses different company names or page-number
+    formats so the extractor can strip them automatically.
+    """
+
+    # Line-prefix strings that should always be suppressed (case-insensitive).
+    company_name_prefixes: tuple[str, ...] = (
+        "unique pharmaceutical laboratories",
+        "(a div. of",
+    )
+
+    # Minimum number of pages a string must appear on to be auto-detected as
+    # header/footer noise (mirrors the QIS _build_noise_blocklist threshold).
+    noise_page_threshold: int = 3
+
+    # Fraction of page height defining the "top margin" zone for auto-detection.
+    noise_top_margin_frac: float = 0.12
+
+    # Fraction of page height defining the "bottom margin" zone.
+    noise_bottom_margin_frac: float = 0.10
+
+
+# ---------------------------------------------------------------------------
+# S2 fill defaults (moved out of docx_builder to keep builder generic)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class S2FillConfig:
+    """Default answers used when parsed values cannot be extracted from the PDF.
+
+    All of these are last-resort fallbacks with an associated warning logged.
+    If the source PDF contains the information, the parsed value takes priority.
+    """
+
+    # 2.3.S.2.2 fixed answers (pharmaceutical manufacturing boilerplate)
+    alternate_processes_default: str = "NA"
+    reprocessing_steps_default: str = "NA"
+
+    # 2.3.S.2.1 manufacturer table
+    manufacturer_table_responsibility_default: str = "Manufacturing, Packaging and Testing"
+    manufacturer_table_apprx_col: str = "Not applicable"
+
+    # GMP fallback sentences (used when no GMP phrase found in source text)
+    gmp_found_sentence: str = (
+        "GMP Certificate of API manufacturer is enclosed under section 3.2.S.2.1 Manufacture (s)."
+    )
+    gmp_fallback_sentence: str = "GMP information is provided in Module 1."
+
+    # Keywords used to detect the GMP block in source text
+    gmp_keywords: tuple[str, ...] = (
+        "certificate of gmp compliance",
+        "gmp",
+    )
+
+    # Keywords used to detect that source text is the main narrative
+    # (as opposed to certificate scan noise, table-of-contents lines, etc.)
+    narrative_start_keywords: tuple[str, ...] = ("the active drug",)
+
+    # Lines containing these phrases signal the end of the useful narrative
+    narrative_end_keywords: tuple[str, ...] = (
+        "certificate of gmp compliance",
+        "certificate of good manufacturing practices",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Top-level application config
+# ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class AppConfig:
@@ -16,6 +159,9 @@ class AppConfig:
     artifacts_dir: Path
     extractor_backend: str
     section: str
+    diagram: DiagramConfig = field(default_factory=DiagramConfig)
+    noise: NoiseConfig = field(default_factory=NoiseConfig)
+    s2_fill: S2FillConfig = field(default_factory=S2FillConfig)
 
     def with_overrides(
         self,
@@ -38,6 +184,9 @@ class AppConfig:
             artifacts_dir=Path(artifacts_dir) if artifacts_dir else self.artifacts_dir,
             extractor_backend=extractor_backend or self.extractor_backend,
             section=section or self.section,
+            diagram=self.diagram,
+            noise=self.noise,
+            s2_fill=self.s2_fill,
         )
 
 
@@ -49,6 +198,11 @@ class PipelineConfig:
     output_docx: Path
     artifacts_dir: Path
     extractor_backend: str = "pymupdf"
+    diagram: DiagramConfig = field(default_factory=DiagramConfig)
+    noise: NoiseConfig = field(default_factory=NoiseConfig)
+    s2_fill: S2FillConfig = field(default_factory=S2FillConfig)
+    verification_report_name: str = "verification_report.txt"
+    generation_log_name: str = "generation.log"
 
     @property
     def module3_root(self) -> Path:
@@ -60,17 +214,21 @@ class PipelineConfig:
 
     @property
     def verification_report_path(self) -> Path:
-        return self.artifacts_dir / "verification_report.txt"
+        return self.artifacts_dir / self.verification_report_name
 
     @property
     def generation_log_path(self) -> Path:
-        return self.artifacts_dir / "generation.log"
+        return self.artifacts_dir / self.generation_log_name
 
     def ensure_directories(self) -> None:
         self.artifacts_dir.mkdir(parents=True, exist_ok=True)
         self.image_artifacts_dir.mkdir(parents=True, exist_ok=True)
         self.output_docx.parent.mkdir(parents=True, exist_ok=True)
 
+
+# ---------------------------------------------------------------------------
+# YAML loader
+# ---------------------------------------------------------------------------
 
 class ConfigLoader:
     def __init__(self, config_path: Path) -> None:
@@ -83,6 +241,10 @@ class ConfigLoader:
         data = self._load_yaml(self.config_path)
         base_dir = self.config_path.parent
 
+        diagram = self._parse_diagram_config(data.get("diagram") or {})
+        noise = self._parse_noise_config(data.get("noise") or {})
+        s2_fill = self._parse_s2_fill_config(data.get("s2_fill") or {})
+
         return AppConfig(
             template_docx=self._resolve_path(data, "template_docx", base_dir),
             dossier_root=self._resolve_path(data, "dossier_root", base_dir),
@@ -91,6 +253,94 @@ class ConfigLoader:
             artifacts_dir=self._resolve_path(data, "artifacts_dir", base_dir),
             extractor_backend=str(data.get("extractor_backend", "pymupdf")),
             section=str(data.get("section", "s1")).lower(),
+            diagram=diagram,
+            noise=noise,
+            s2_fill=s2_fill,
+        )
+
+    @staticmethod
+    def _parse_diagram_config(raw: dict[str, Any]) -> DiagramConfig:
+        defaults = DiagramConfig()
+        return DiagramConfig(
+            vector_diagram_sections=tuple(
+                raw.get("vector_diagram_sections", list(defaults.vector_diagram_sections))
+            ),
+            page_render_sections=tuple(
+                raw.get("page_render_sections", list(defaults.page_render_sections))
+            ),
+            min_diagram_drawings=int(
+                raw.get("min_diagram_drawings", defaults.min_diagram_drawings)
+            ),
+            chars_per_drawing_threshold=float(
+                raw.get("chars_per_drawing_threshold", defaults.chars_per_drawing_threshold)
+            ),
+            render_dpi_scale=float(
+                raw.get("render_dpi_scale", defaults.render_dpi_scale)
+            ),
+            header_crop_frac=float(
+                raw.get("header_crop_frac", defaults.header_crop_frac)
+            ),
+            footer_crop_frac=float(
+                raw.get("footer_crop_frac", defaults.footer_crop_frac)
+            ),
+            diagram_keywords=tuple(
+                raw.get("diagram_keywords", list(defaults.diagram_keywords))
+            ),
+            diagram_exclude_keywords=tuple(
+                raw.get("diagram_exclude_keywords", list(defaults.diagram_exclude_keywords))
+            ),
+        )
+
+    @staticmethod
+    def _parse_noise_config(raw: dict[str, Any]) -> NoiseConfig:
+        defaults = NoiseConfig()
+        return NoiseConfig(
+            company_name_prefixes=tuple(
+                raw.get("company_name_prefixes", list(defaults.company_name_prefixes))
+            ),
+            noise_page_threshold=int(
+                raw.get("noise_page_threshold", defaults.noise_page_threshold)
+            ),
+            noise_top_margin_frac=float(
+                raw.get("noise_top_margin_frac", defaults.noise_top_margin_frac)
+            ),
+            noise_bottom_margin_frac=float(
+                raw.get("noise_bottom_margin_frac", defaults.noise_bottom_margin_frac)
+            ),
+        )
+
+    @staticmethod
+    def _parse_s2_fill_config(raw: dict[str, Any]) -> S2FillConfig:
+        defaults = S2FillConfig()
+        return S2FillConfig(
+            alternate_processes_default=str(
+                raw.get("alternate_processes_default", defaults.alternate_processes_default)
+            ),
+            reprocessing_steps_default=str(
+                raw.get("reprocessing_steps_default", defaults.reprocessing_steps_default)
+            ),
+            manufacturer_table_responsibility_default=str(
+                raw.get(
+                    "manufacturer_table_responsibility_default",
+                    defaults.manufacturer_table_responsibility_default,
+                )
+            ),
+            manufacturer_table_apprx_col=str(
+                raw.get("manufacturer_table_apprx_col", defaults.manufacturer_table_apprx_col)
+            ),
+            gmp_found_sentence=str(
+                raw.get("gmp_found_sentence", defaults.gmp_found_sentence)
+            ),
+            gmp_fallback_sentence=str(
+                raw.get("gmp_fallback_sentence", defaults.gmp_fallback_sentence)
+            ),
+            gmp_keywords=tuple(raw.get("gmp_keywords", list(defaults.gmp_keywords))),
+            narrative_start_keywords=tuple(
+                raw.get("narrative_start_keywords", list(defaults.narrative_start_keywords))
+            ),
+            narrative_end_keywords=tuple(
+                raw.get("narrative_end_keywords", list(defaults.narrative_end_keywords))
+            ),
         )
 
     @staticmethod

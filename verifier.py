@@ -20,10 +20,10 @@ class SectionVerifier:
             text = (p.text or "").strip()
             if not in_section and start_label.lower() in text.lower():
                 in_section = True
-            if in_section:
-                lines.append(text)
             if in_section and end_label.lower() in text.lower():
                 break
+            if in_section:
+                lines.append(text)
 
         return "\n".join(lines)
 

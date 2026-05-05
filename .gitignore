@@ -10,6 +10,7 @@ __pycache__/
 # Artifacts and outputs
 artifacts/
 outputs/
+.code-review-graph/
 
 # Logs
 *.log
@@ -17,3 +18,13 @@ outputs/
 # OS
 .DS_Store
 Thumbs.db
+
+# Local tooling/config
+.claude/
+
+# Local docs/scripts not needed in VCS
+QOS.MD
+_patch.py
+
+# Local nested project clone
+JB-Pharma-QIS/

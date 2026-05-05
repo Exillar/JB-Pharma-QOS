@@ -4,6 +4,7 @@ import argparse
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
+import shutil
 
 from config_loader import AppConfig, ConfigLoader, PipelineConfig
 from docx_builder import DocxFiller, S2DocxFiller
@@ -26,7 +27,10 @@ class QosPipeline:
     SECTION_SPECS: dict[str, SectionSpec] = {
         "s1": SectionSpec(
             refer_sections=["3.2.S.1.1", "3.2.S.1.2", "3.2.S.1.3"],
-            filler_factory=lambda cfg: DocxFiller(cfg.template_docx, cfg.filled_reference_docx),
+            filler_factory=lambda cfg: DocxFiller(
+                cfg.template_docx,
+                cfg.filled_reference_docx,
+            ),
             fill_method="fill_s1_section",
             start_label="2.3.S.1 General Information",
             end_label="2.3.S.2 Manufacture",
@@ -41,7 +45,14 @@ class QosPipeline:
                 "3.2.S.2.5",
                 "3.2.S.2.6",
             ],
-            filler_factory=lambda cfg: S2DocxFiller(cfg.template_docx, cfg.filled_reference_docx),
+            filler_factory=lambda cfg: S2DocxFiller(
+                cfg.template_docx,
+                cfg.filled_reference_docx,
+                images_dir=cfg.image_artifacts_dir,
+                s2_fill_cfg=cfg.s2_fill,
+                noise_cfg=cfg.noise,
+                diagram_cfg=cfg.diagram,
+            ),
             fill_method="fill_s2_section",
             start_label="2.3.S.2 Manufacture",
             end_label="2.3.S.3 Characterisation",
@@ -62,7 +73,11 @@ class QosPipeline:
 
         mapper = SectionMapper(self.config.module3_root)
         if self.config.extractor_backend == "pymupdf":
-            extractor = PdfSectionExtractor(self.config.image_artifacts_dir)
+            extractor = PdfSectionExtractor(
+                self.config.image_artifacts_dir,
+                diagram_cfg=self.config.diagram,
+                noise_cfg=self.config.noise,
+            )
         else:
             raise ValueError(f"Unsupported extractor backend: {self.config.extractor_backend}")
         filler = spec.filler_factory(self.config)
@@ -132,25 +147,25 @@ def build_parser() -> argparse.ArgumentParser:
         default="config.yaml",
         help="Path to YAML config (defaults to ./config.yaml)",
     )
-    parser.add_argument("--template", default="", help="Path to Quality Overall Summary template DOCX")
-    parser.add_argument("--dossier-root", default="", help="Path to dossier root folder (e.g., Cardiolek)")
-    parser.add_argument("--filled-reference", default="", help="Path to already-filled QOS DOCX for verification")
-    parser.add_argument("--output", default="", help="Output DOCX path")
+    parser.add_argument("--template", default=None, help="Path to Quality Overall Summary template DOCX")
+    parser.add_argument("--dossier-root", default=None, help="Path to dossier root folder (e.g., Cardiolek)")
+    parser.add_argument("--filled-reference", default=None, help="Path to already-filled QOS DOCX for verification")
+    parser.add_argument("--output", default=None, help="Output DOCX path")
     parser.add_argument(
         "--artifacts-dir",
-        default=str(Path(__file__).resolve().parent / "artifacts"),
+        default=None,
         help="Artifacts folder for images and reports",
     )
     parser.add_argument(
         "--backend",
-        default="pymupdf",
+        default=None,
         choices=["pymupdf"],
         help="Extraction backend",
     )
     parser.add_argument(
         "--section",
-        default="s1",
-        choices=["s1", "s2"],
+        default=None,
+        choices=["s1", "s2", "all"],
         help="QOS section automation target",
     )
     return parser
@@ -158,13 +173,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _apply_overrides(base: AppConfig, args: argparse.Namespace) -> AppConfig:
     return base.with_overrides(
-        template_docx=args.template or None,
-        dossier_root=args.dossier_root or None,
-        filled_reference_docx=args.filled_reference or None,
-        output_docx=args.output or None,
-        artifacts_dir=args.artifacts_dir or None,
-        extractor_backend=args.backend or None,
-        section=args.section or None,
+        template_docx=args.template,
+        dossier_root=args.dossier_root,
+        filled_reference_docx=args.filled_reference,
+        output_docx=args.output,
+        artifacts_dir=args.artifacts_dir,
+        extractor_backend=args.backend,
+        section=args.section,
     )
 
 
@@ -174,24 +189,73 @@ def main() -> None:
     loader = ConfigLoader(Path(args.config))
     app_config = _apply_overrides(loader.load(), args)
 
-    config = PipelineConfig(
-        template_docx=app_config.template_docx,
-        dossier_root=app_config.dossier_root,
-        filled_reference_docx=app_config.filled_reference_docx,
-        output_docx=app_config.output_docx,
-        artifacts_dir=app_config.artifacts_dir,
-        extractor_backend=app_config.extractor_backend,
-    )
+    def cleanup_images_dir() -> None:
+        shutil.rmtree(app_config.artifacts_dir / "images", ignore_errors=True)
 
-    pipeline = QosPipeline(config, app_config.section)
-    result = pipeline.run()
+    def run_section(
+        section: str,
+        template_docx: Path,
+        output_docx: Path,
+        *,
+        verification_report_name: str = "verification_report.txt",
+        generation_log_name: str = "generation.log",
+    ) -> PipelineResult:
+        config = PipelineConfig(
+            template_docx=template_docx,
+            dossier_root=app_config.dossier_root,
+            filled_reference_docx=app_config.filled_reference_docx,
+            output_docx=output_docx,
+            artifacts_dir=app_config.artifacts_dir,
+            extractor_backend=app_config.extractor_backend,
+            diagram=app_config.diagram,
+            noise=app_config.noise,
+            s2_fill=app_config.s2_fill,
+            verification_report_name=verification_report_name,
+            generation_log_name=generation_log_name,
+        )
+        pipeline = QosPipeline(config, section)
+        return pipeline.run()
 
-    print(f"=== QOS {app_config.section.upper()} Generation Summary ===")
-    print(f"Output DOCX: {result.output_docx}")
-    print(f"Verification report: {result.verification_report}")
-    print("Warnings:")
-    for warning in result.warnings:
-        print(f"- {warning}")
+    if app_config.section == "all":
+        intermediate = app_config.artifacts_dir / "qos_s1_intermediate.docx"
+        first_result = run_section(
+            "s1",
+            app_config.template_docx,
+            intermediate,
+            verification_report_name="verification_report_part_a.txt",
+            generation_log_name="generation_part_a.log",
+        )
+        second_result = run_section(
+            "s2",
+            intermediate,
+            app_config.output_docx,
+            verification_report_name="verification_report_part_b.txt",
+            generation_log_name="generation_part_b.log",
+        )
+
+        cleanup_images_dir()
+
+        print("=== QOS ALL Generation Summary ===")
+        print(f"Intermediate DOCX: {first_result.output_docx}")
+        print(f"Final Output DOCX: {second_result.output_docx}")
+        print(f"Verification report (part A): {first_result.verification_report}")
+        print(f"Verification report (part B): {second_result.verification_report}")
+        print("Warnings:")
+        for warning in first_result.warnings:
+            print(f"- {warning}")
+        for warning in second_result.warnings:
+            print(f"- {warning}")
+    else:
+        result = run_section(app_config.section, app_config.template_docx, app_config.output_docx)
+
+        cleanup_images_dir()
+
+        print(f"=== QOS {app_config.section.upper()} Generation Summary ===")
+        print(f"Output DOCX: {result.output_docx}")
+        print(f"Verification report: {result.verification_report}")
+        print("Warnings:")
+        for warning in result.warnings:
+            print(f"- {warning}")
 
 
 if __name__ == "__main__":

@@ -1,3 +1,14 @@
+"""
+Module: docx_builder
+Responsibility: Fills QOS template DOCX paragraphs and tables with content
+extracted from CTD Module 3 PDFs.
+
+Design principles (borrowed from JB-Pharma-QIS):
+- _DocxHelper base class holds ALL shared XML/paragraph utilities.
+- No hardcoded drug names, company names, or pharmaceutical properties.
+- All fallback strings live in config_loader.S2FillConfig.
+- Noise cleaning uses the auto-detected blocklist from pdf_extractor.
+"""
 from __future__ import annotations
 
 import re
@@ -7,30 +18,311 @@ from docx import Document
 from docx.document import Document as _Document
 from docx.oxml import OxmlElement
 from docx.text.paragraph import Paragraph
-from docx.shared import Inches
+
+import fitz
 
 from pdf_extractor import ExtractedSectionContent
+from config_loader import S2FillConfig, NoiseConfig, DiagramConfig
 
 
-class DocxFiller:
-    SECTION_START = "2.3.S.1 General Information"
-    SECTION_END = "2.3.S.2 Manufacture"
+# ---------------------------------------------------------------------------
+# Module-level helpers (ported from QIS)
+# ---------------------------------------------------------------------------
 
-    def __init__(self, template_docx: Path, filled_reference_docx: Path | None = None) -> None:
-        self.template_docx = template_docx
-        self.filled_reference_docx = filled_reference_docx
+_PAGE_NUM_RE = re.compile(r"^\d{1,4}$")
+_PAGE_OF_RE = re.compile(r"^\d+\s+of\s+\d+\s*$", re.IGNORECASE)
+
+
+def _safe_row_cells(row):
+    try:
+        return tuple(row.cells)
+    except Exception:
+        return ()
+
+
+def _collapse_blank_paragraphs(doc: _Document) -> int:
+    _NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    consecutive = 0
+    to_remove = []
+    for elem in list(doc.element.body):
+        if elem.tag.split("}")[-1] == "p":
+            txt = "".join(t.text or "" for t in elem.iter(f"{{{_NS}}}t")).strip()
+            # Check if paragraph has drawings (images/shapes)
+            has_drawing = len(list(elem.iter(f"{{{_NS}}}drawing"))) > 0
+            # Only mark as blank if it has no text AND no drawings
+            if not txt and not has_drawing:
+                consecutive += 1
+                if consecutive > 1:
+                    to_remove.append(elem)
+            else:
+                consecutive = 0
+        else:
+            consecutive = 0
+    for elem in to_remove:
+        parent = elem.getparent()
+        if parent is not None:
+            parent.remove(elem)
+    return len(to_remove)
+
+
+def _remove_repeated_header_paragraphs(doc: _Document) -> int:
+    """
+    Remove repeated short lines that are typically injected PDF headers.
+    """
+    from collections import Counter
+
+    _NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    freq = Counter(p.text.strip() for p in doc.paragraphs if p.text.strip())
+    noise = {t for t, c in freq.items() if c >= 3 and len(t) < 120}
+
+    removed = 0
+    for elem in list(doc.element.body):
+        if elem.tag.split("}")[-1] != "p":
+            continue
+        text = "".join(t.text or "" for t in elem.iter(f"{{{_NS}}}t")).strip()
+        if text in noise:
+            parent = elem.getparent()
+            if parent is not None:
+                parent.remove(elem)
+                removed += 1
+    return removed
+
+
+def _remove_pdf_noise_paragraphs(doc: _Document) -> int:
+    """
+    Remove generic page-header/footer style paragraphs left after insertion.
+    """
+    _NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    body = doc.element.body
+    elements = list(body)
+
+    def _wt(e) -> str:
+        return "".join(t.text or "" for t in e.iter(f"{{{_NS}}}t")).strip()
+
+    removed = 0
+    for i, elem in enumerate(elements):
+        if elem.tag.split("}")[-1] != "p":
+            continue
+        text = _wt(elem)
+        if not text:
+            continue
+
+        drop = False
+        if re.match(r"^.{10,75}\s+\d{1,4}$", text) and len(text) < 80:
+            drop = True
+        elif re.search(r"3\.2[\. ][A-Z0-9P]", text) and len(text) < 200:
+            for j in range(max(0, i - 10), i):
+                if re.search(r"2\.3\.[SP]", _wt(elements[j])):
+                    drop = True
+                    break
+        elif _PAGE_NUM_RE.match(text) or _PAGE_OF_RE.match(text):
+            drop = True
+
+        if drop:
+            parent = elem.getparent()
+            if parent is not None:
+                parent.remove(elem)
+                removed += 1
+    return removed
+
+
+def _remove_empty_visual_tables(doc: _Document, *, keep_first_n_tables: int) -> int:
+    """
+    Remove fully/mostly empty tables created as visual artifacts.
+    Original template tables are protected by keep_first_n_tables.
+    """
+    _NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    removed = 0
+
+    def get_text(cell) -> str:
+        return "".join(t.text or "" for t in cell._element.iter(f"{{{_NS}}}t")).strip()
+
+    for idx, table in enumerate(list(doc.tables)):
+        if idx < keep_first_n_tables:
+            continue
+
+        total_cells = 0
+        empty_cells = 0
+        text_cells = 0
+        for row in table.rows:
+            for cell in _safe_row_cells(row):
+                total_cells += 1
+                text = get_text(cell)
+                if not text:
+                    empty_cells += 1
+                else:
+                    text_cells += 1
+
+        if total_cells == 0:
+            continue
+
+        if total_cells > 4 and text_cells == 0:
+            table._element.getparent().remove(table._element)
+            removed += 1
+        elif total_cells > 6 and (empty_cells / total_cells) > 0.8:
+            table._element.getparent().remove(table._element)
+            removed += 1
+
+    return removed
+
+
+def _remove_low_content_injected_tables(doc: _Document, *, keep_first_n_tables: int) -> int:
+    """
+    Remove low-value injected table artifacts while preserving template tables.
+    """
+    _NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    removed = 0
+
+    def get_text(cell) -> str:
+        return "".join(t.text or "" for t in cell._element.iter(f"{{{_NS}}}t")).strip()
+
+    for idx, table in enumerate(list(doc.tables)):
+        if idx < keep_first_n_tables:
+            continue
+
+        total_cells = 0
+        text_cells = 0
+        text_chars = 0
+
+        for row in table.rows:
+            for cell in _safe_row_cells(row):
+                total_cells += 1
+                text = get_text(cell)
+                if text:
+                    text_cells += 1
+                    text_chars += len(text)
+
+        if total_cells == 0:
+            continue
+
+        empty_ratio = (total_cells - text_cells) / total_cells
+        should_remove = False
+        if text_cells == 0 and total_cells >= 4:
+            should_remove = True
+        elif empty_ratio > 0.85 and text_chars < 80 and total_cells >= 6:
+            should_remove = True
+        elif text_cells <= 2 and total_cells >= 8 and text_chars < 100:
+            should_remove = True
+
+        if should_remove:
+            table._element.getparent().remove(table._element)
+            removed += 1
+
+    return removed
+
+
+def _run_injected_artifact_cleanup(doc: _Document, *, keep_first_n_tables: int) -> dict[str, int]:
+    """
+    Unified cleanup pipeline for post-insertion artifacts.
+    Returns per-step removal counters for debugging/telemetry.
+    """
+    stats = {
+        "repeated_headers_removed": _remove_repeated_header_paragraphs(doc),
+        "noise_paragraphs_removed": _remove_pdf_noise_paragraphs(doc),
+        "empty_tables_removed": _remove_empty_visual_tables(
+            doc, keep_first_n_tables=keep_first_n_tables
+        ),
+        "low_content_tables_removed": _remove_low_content_injected_tables(
+            doc, keep_first_n_tables=keep_first_n_tables
+        ),
+        "blank_paragraphs_collapsed": _collapse_blank_paragraphs(doc),
+    }
+    return stats
+
+
+# ---------------------------------------------------------------------------
+# Shared base class
+# ---------------------------------------------------------------------------
+
+class _DocxHelper:
+    """Shared XML/paragraph utilities for all filler classes."""
+
+    SECTION_START: str = ""
+    SECTION_END: str = ""
+
+    # ------------------------------------------------------------------
+    # Low-level XML helpers
+    # ------------------------------------------------------------------
 
     @staticmethod
     def _insert_paragraph_after(paragraph: Paragraph, text: str = "") -> Paragraph:
         new_p = OxmlElement("w:p")
         paragraph._p.addnext(new_p)
-        new_para = Paragraph(new_p, paragraph._parent)
+        para = Paragraph(new_p, paragraph._parent)
         if text:
-            new_para.add_run(text)
-        return new_para
+            para.add_run(text)
+        return para
+
+    def _get_available_page_width(self, doc: _Document) -> int:
+        """
+        Calculate available width for content (page width - margins) in EMUs.
+        Used to scale images proportionally without hardcoding sizes.
+        Returns width in EMUs (914400 EMU = 1 inch).
+        """
+        try:
+            section = doc.sections[0]
+            page_width = section.page_width
+            left_margin = section.left_margin
+            right_margin = section.right_margin
+            available = page_width - left_margin - right_margin
+            # Convert to Inches and back to maintain proper spacing
+            # Subtract a small margin for padding (0.2 inches on each side)
+            padding = int(914400 * 0.2)
+            return max(available - 2 * padding, int(914400 * 4))  # Minimum 4 inches
+        except Exception:
+            # Fallback to reasonable default if section info unavailable
+            return int(914400 * 5.5)  # 5.5 inches
+
+    def _get_available_page_height(self, doc: _Document) -> int:
+        """Calculate available page height for inserted image content in EMUs."""
+        try:
+            section = doc.sections[0]
+            page_height = section.page_height
+            top_margin = section.top_margin
+            bottom_margin = section.bottom_margin
+            available = page_height - top_margin - bottom_margin
+            padding = int(914400 * 0.3)
+            return max(available - 2 * padding, int(914400 * 3.5))
+        except Exception:
+            return int(914400 * 7.5)
+
+    def _add_picture_autofit(self, run, image_path: Path | str, doc: _Document) -> None:
+        """
+        Add picture while respecting both width and height bounds.
+        This prevents very tall images from overflowing the page visually.
+        """
+        img_path = Path(image_path)
+        max_width = self._get_available_page_width(doc)
+        max_height = self._get_available_page_height(doc)
+        target_width = max_width
+
+        try:
+            pix = fitz.Pixmap(str(img_path))
+            w = max(1, pix.width)
+            h = max(1, pix.height)
+            aspect = h / w
+            if aspect > 0:
+                height_limited_width = int(max_height / aspect)
+                if height_limited_width > 0:
+                    target_width = min(max_width, height_limited_width)
+        except Exception:
+            target_width = max_width
+
+        run.add_picture(str(img_path), width=target_width)
 
     @staticmethod
-    def _set_runs_style(paragraph: Paragraph, bold: bool | None = None, italic: bool | None = None) -> None:
+    def _delete_paragraph(paragraph: Paragraph) -> None:
+        elem = paragraph._element
+        parent = elem.getparent()
+        if parent is not None:
+            parent.remove(elem)
+
+    @staticmethod
+    def _set_runs_style(
+        paragraph: Paragraph,
+        bold: bool | None = None,
+        italic: bool | None = None,
+    ) -> None:
         if not paragraph.runs:
             paragraph.add_run(paragraph.text or "")
         for run in paragraph.runs:
@@ -40,8 +332,10 @@ class DocxFiller:
                 run.italic = italic
 
     @staticmethod
-    def _replace_paragraph_with_runs(paragraph: Paragraph, chunks: list[tuple[str, bool | None, bool | None]]) -> None:
-        # Remove existing runs first.
+    def _replace_paragraph_with_runs(
+        paragraph: Paragraph,
+        chunks: list[tuple[str, bool | None, bool | None]],
+    ) -> None:
         for run in list(paragraph.runs):
             paragraph._p.remove(run._r)
         for text, bold, italic in chunks:
@@ -51,16 +345,111 @@ class DocxFiller:
             if italic is not None:
                 r.italic = italic
 
-    @staticmethod
-    def _delete_paragraph(paragraph: Paragraph) -> None:
-        element = paragraph._element
-        parent = element.getparent()
-        if parent is not None:
-            parent.remove(element)
+    # ------------------------------------------------------------------
+    # Paragraph search helpers
+    # ------------------------------------------------------------------
 
     @staticmethod
-    def _clean_line(line: str) -> str:
-        return re.sub(r"\s+", " ", line.strip())
+    def _norm(s: str) -> str:
+        return re.sub(r"\s+", " ", s).strip().lower()
+
+    @classmethod
+    def _find_para_index(
+        cls,
+        paragraphs: list[Paragraph],
+        needle: str,
+        start_idx: int,
+        end_idx: int,
+        *,
+        startswith: bool = False,
+    ) -> int | None:
+        n = cls._norm(needle)
+        for i in range(start_idx, min(end_idx, len(paragraphs))):
+            t = cls._norm(paragraphs[i].text or "")
+            if startswith and t.startswith(n):
+                return i
+            if not startswith and n in t:
+                return i
+        return None
+
+    @classmethod
+    def _find_para_index_doc(
+        cls,
+        doc: _Document,
+        needle: str,
+        start_idx: int,
+        end_idx: int,
+        *,
+        startswith: bool = False,
+    ) -> int | None:
+        return cls._find_para_index(
+            doc.paragraphs, needle, start_idx, end_idx, startswith=startswith
+        )
+
+    # ------------------------------------------------------------------
+    # Section range
+    # ------------------------------------------------------------------
+
+    def _get_target_range(self, doc: _Document) -> tuple[int, int]:
+        start_idx = None
+        end_idx = None
+        for i, p in enumerate(doc.paragraphs):
+            text = (p.text or "").strip()
+            if start_idx is None and self.SECTION_START.lower() in text.lower():
+                start_idx = i
+            if start_idx is not None and self.SECTION_END.lower() in text.lower():
+                end_idx = i
+                break
+        if start_idx is None:
+            raise ValueError(f"Section start '{self.SECTION_START}' not found in template DOCX")
+        return start_idx, end_idx if end_idx is not None else len(doc.paragraphs)
+
+    # ------------------------------------------------------------------
+    # Common value insertion
+    # ------------------------------------------------------------------
+
+    def _add_answer_after(self, doc: _Document, anchor_idx: int, value: str) -> None:
+        if not value.strip():
+            return
+        self._insert_paragraph_after(doc.paragraphs[anchor_idx], value)
+
+    def _set_value_under_label(
+        self,
+        doc: _Document,
+        label: str,
+        value: str,
+        start_idx: int,
+        end_idx: int,
+    ) -> None:
+        if not value.strip():
+            return
+        idx = self._find_para_index_doc(doc, label, start_idx, end_idx, startswith=True)
+        if idx is None:
+            return
+        if idx + 1 < len(doc.paragraphs) and not (doc.paragraphs[idx + 1].text or "").strip():
+            doc.paragraphs[idx + 1].text = value
+        else:
+            self._insert_paragraph_after(doc.paragraphs[idx], value)
+
+    def _remove_paragraphs_matching(
+        self,
+        doc: _Document,
+        patterns: list[str],
+        start_idx: int,
+        end_idx: int,
+    ) -> None:
+        to_delete = []
+        for i in range(start_idx, min(end_idx, len(doc.paragraphs))):
+            t = self._norm(doc.paragraphs[i].text or "")
+            if any(t.startswith(self._norm(p)) for p in patterns):
+                to_delete.append(i)
+        for idx in reversed(to_delete):
+            if idx < len(doc.paragraphs):
+                self._delete_paragraph(doc.paragraphs[idx])
+
+    # ------------------------------------------------------------------
+    # Text-block helpers
+    # ------------------------------------------------------------------
 
     @staticmethod
     def _extract_block(text: str, start_pattern: str, end_patterns: list[str]) -> str:
@@ -84,118 +473,47 @@ class DocxFiller:
         return ""
 
     @staticmethod
-    def _find_para_index(paragraphs: list[Paragraph], needle: str, start_idx: int, end_idx: int) -> int | None:
-        needle_norm = re.sub(r"\s+", " ", needle).strip().lower()
-        for i in range(start_idx, min(end_idx, len(paragraphs))):
-            text_norm = re.sub(r"\s+", " ", (paragraphs[i].text or "")).strip().lower()
-            if needle_norm in text_norm:
-                return i
-        return None
+    def _clean_line(line: str) -> str:
+        return re.sub(r"\s+", " ", line.strip())
 
-    @staticmethod
-    def _find_para_index_startswith(paragraphs: list[Paragraph], needle: str, start_idx: int, end_idx: int) -> int | None:
-        needle_norm = re.sub(r"\s+", " ", needle).strip().lower()
-        for i in range(start_idx, min(end_idx, len(paragraphs))):
-            text_norm = re.sub(r"\s+", " ", (paragraphs[i].text or "")).strip().lower()
-            if text_norm.startswith(needle_norm):
-                return i
-        return None
-
-    def _add_answer_after(self, doc: _Document, anchor_idx: int, value: str) -> None:
-        if not value.strip():
-            return
-        self._insert_paragraph_after(doc.paragraphs[anchor_idx], value)
-
-    def _set_value_under_label(self, doc: _Document, label: str, value: str, start_idx: int, end_idx: int) -> None:
-        if not value.strip():
-            return
-        idx = self._find_para_index_startswith(doc.paragraphs, label, start_idx, end_idx)
-        if idx is None:
-            return
-        if idx + 1 < len(doc.paragraphs) and not (doc.paragraphs[idx + 1].text or "").strip():
-            doc.paragraphs[idx + 1].text = value
-        else:
-            self._insert_paragraph_after(doc.paragraphs[idx], value)
-
-    def _remove_paragraphs_matching(self, doc: _Document, patterns: list[str], start_idx: int, end_idx: int) -> None:
-        to_delete = []
-        for i in range(start_idx, min(end_idx, len(doc.paragraphs))):
-            text = re.sub(r"\s+", " ", (doc.paragraphs[i].text or "")).strip().lower()
-            if any(text.startswith(p.lower()) for p in patterns):
-                to_delete.append(i)
-
-        # Delete in reverse order to keep indices stable.
-        for idx in reversed(to_delete):
-            if idx < len(doc.paragraphs):
-                self._delete_paragraph(doc.paragraphs[idx])
-
-    def _apply_visual_formatting(self, doc: _Document, start_idx: int, end_idx: int) -> None:
-        # Match section-heading and label emphasis closer to the filled reference.
-        for i in range(start_idx, min(end_idx, len(doc.paragraphs))):
-            p = doc.paragraphs[i]
-            t = (p.text or "").strip()
-
-            if t.startswith("2.3.S.1 General Information"):
-                self._set_runs_style(p, bold=True, italic=False)
-            elif t.startswith("2.3.S.1.1 Nomenclature"):
-                self._set_runs_style(p, bold=False, italic=False)
-            elif t.startswith("2.3.S.1.2 Structure"):
-                self._set_runs_style(p, bold=True, italic=False)
-            elif t.startswith("2.3.S.1.3 General Properties"):
-                self._set_runs_style(p, bold=True, italic=False)
-
-            if t.startswith("(Recommended) International Non-proprietary name (INN):"):
-                self._set_runs_style(p, bold=True, italic=False)
-            elif t.startswith("Compendial name"):
-                self._set_runs_style(p, bold=True, italic=False)
-            elif t.startswith("Chemical name"):
-                self._set_runs_style(p, bold=True, italic=False)
-            elif t.startswith("(a)\tPhysical description"):
-                self._set_runs_style(p, bold=False, italic=False)
-
-    def _resolve_name_manufacturer_line(self) -> str:
-        if self.filled_reference_docx and self.filled_reference_docx.exists():
-            try:
-                ref = Document(self.filled_reference_docx)
-                for i, p in enumerate(ref.paragraphs):
-                    txt = (p.text or "").strip()
-                    if "2.3.S.1.1 Nomenclature".lower() in txt.lower():
-                        for j in range(i + 1, min(i + 6, len(ref.paragraphs))):
-                            cand = (ref.paragraphs[j].text or "").strip()
-                            if cand.startswith("(") and "," in cand:
-                                return cand
-            except Exception:
-                pass
+    def _resolve_name_manufacturer_line(
+        self, ref_docx: Path | None, section_heading: str
+    ) -> str:
+        """Read the filled reference DOCX to find the (drug, manufacturer) line."""
+        if not ref_docx or not ref_docx.exists():
+            return ""
+        try:
+            ref = Document(ref_docx)
+            for i, p in enumerate(ref.paragraphs):
+                if section_heading.lower() in (p.text or "").lower():
+                    for j in range(i + 1, min(i + 6, len(ref.paragraphs))):
+                        cand = (ref.paragraphs[j].text or "").strip()
+                        if cand.startswith("(") and "," in cand:
+                            return cand
+        except Exception:
+            pass
         return ""
 
-    def _fill_property_table(self, doc: _Document, start_idx: int, end_idx: int, s13: dict[str, str]) -> None:
-        def norm(s: str) -> str:
-            return re.sub(r"\s+", " ", s).strip().lower()
 
-        table_row_map = {
-            "ph": s13["ph"],
-            "pk": s13["pk"],
-            "pka": s13["pk"],
-            "partition coefficients": s13["partition"],
-            "melting/boiling points": s13["melting"],
-            "specific optical rotation (specify solvent)": s13["rotation"],
-            "refractive index (liquids)": s13["refractive"],
-            "hygroscopicity": s13["hygro"],
-            "uv absorption maxima/molar absorptivity": s13["uv"],
-            "other": s13["other"],
-        }
+# ---------------------------------------------------------------------------
+# S1 filler — 2.3.S.1 General Information
+# ---------------------------------------------------------------------------
 
-        for table in doc.tables:
-            if not table.rows:
-                continue
-            head = norm(table.cell(0, 0).text)
-            if head != "property":
-                continue
+class DocxFiller(_DocxHelper):
+    SECTION_START = "2.3.S.1 General Information"
+    SECTION_END = "2.3.S.2 Manufacture"
 
-            for row in table.rows[1:]:
-                key = norm(row.cells[0].text)
-                if key in table_row_map and len(row.cells) > 1:
-                    row.cells[1].text = table_row_map[key]
+    def __init__(
+        self,
+        template_docx: Path,
+        filled_reference_docx: Path | None = None,
+    ) -> None:
+        self.template_docx = template_docx
+        self.filled_reference_docx = filled_reference_docx
+
+    # ------------------------------------------------------------------
+    # Parsers — extract from PDF text, no drug-specific fallbacks
+    # ------------------------------------------------------------------
 
     def _parse_s11(self, raw_text: str) -> dict[str, str]:
         inn_block = self._extract_block(
@@ -213,14 +531,18 @@ class DocxFiller:
             r"Chemical\s+name\s*\(s\)\s*:",
             [r"Chemical\s+Abstracts\s+Service\s*\(CAS\)\s+registry\s+number\s*:"],
         )
-
+        cas_block = self._extract_block(
+            raw_text,
+            r"Chemical\s+Abstracts\s+Service\s*\(CAS\)\s+registry\s+number\s*:",
+            [r"Other\s+non-proprietary\s+name"],
+        )
         return {
             "a": self._first_meaningful_line(inn_block),
             "b": self._first_meaningful_line(comp_block),
             "c": chem_block.strip(),
             "d": "",
             "e": "",
-            "f": "",
+            "f": self._first_meaningful_line(cas_block),
         }
 
     def _parse_s12(self, raw_text: str) -> dict[str, str]:
@@ -232,64 +554,95 @@ class DocxFiller:
         }
 
     def _parse_s13(self, raw_text: str) -> dict[str, str]:
+        """Extract physicochemical properties from raw PDF text.
+        Returns empty strings when not found — NO drug-specific fallbacks.
+        """
         melt = self._extract_block(raw_text, r"\bMelting\s+point\b", [r"\bpH\s*[-:]\b"]) or ""
         ph = self._extract_block(raw_text, r"\bpH\s*[-:]", [r"\bPartition\s+coefficients\b"]) or ""
         part = self._extract_block(raw_text, r"\bPartition\s+coefficients\b\s*[-:]", [r"\bPK\s*[-:]"]) or ""
         pk = self._extract_block(raw_text, r"\bPK\s*[-:]", [r"\bSpecific\s+Rotation\b"]) or ""
-        rot = self._extract_block(raw_text, r"\bSpecific\s+Rotation\b", [r"\bPolymeric\s+Form\b"]) or ""
+        rot = self._extract_block(raw_text, r"\bSpecific\s+Rotation\b", [r"\bPolymorphic\s+Form\b", r"\bSolub"]) or ""
 
-        ph_v = self._first_meaningful_line(ph)
-        pk_v = "\n".join([ln.strip() for ln in pk.splitlines() if ln.strip()])
-        part_v = "\n".join([ln.strip() for ln in part.splitlines() if ln.strip()])
-        melt_v = self._first_meaningful_line(melt)
-        rot_v = self._first_meaningful_line(rot)
-
-        # Normalize to the reference-style wording for this dossier.
-        desc_v = "White or almost white, crystalline powder."
-        sol_v = (
-            "Very soluble in water, freely soluble in Methanol and practically insoluble in "
-            "Dichloromethane, Chloroform and Ether."
-        )
-        poly_v = "Amorphous form powder"
-        refractive = "--------"
-        hygro = ""
-        uv = ""
+        desc = self._extract_block(raw_text, r"\bPhysical\s+description\b\s*[-:]?", [r"\bSolub", r"\bPolymorphic"]) or ""
+        sol = self._extract_block(raw_text, r"\bSolub(?:ility|ilities)\b\s*[-:]?", [r"\bPolymorphic", r"\bpH\b"]) or ""
+        poly = self._extract_block(raw_text, r"\bPolymorphic\s+[Ff]orm\b\s*[-:]?", [r"\bSolvate", r"\bHydrate"]) or ""
 
         return {
-            "a": desc_v,
-            "b": sol_v,
-            "poly": poly_v,
-            "solvate": "NA",
-            "hydrate": "NA",
+            "a": self._first_meaningful_line(desc),
+            "b": self._first_meaningful_line(sol) or sol.strip(),
+            "poly": self._first_meaningful_line(poly),
+            "solvate": "",
+            "hydrate": "",
             "other": "",
-            "ph": ph_v,
-            "pk": pk_v,
-            "partition": part_v,
-            "melting": melt_v,
-            "rotation": rot_v,
-            "refractive": refractive,
-            "hygro": hygro,
-            "uv": uv,
+            "ph": self._first_meaningful_line(ph),
+            "pk": "\n".join(ln.strip() for ln in pk.splitlines() if ln.strip()),
+            "partition": "\n".join(ln.strip() for ln in part.splitlines() if ln.strip()),
+            "melting": self._first_meaningful_line(melt),
+            "rotation": self._first_meaningful_line(rot),
+            "refractive": "",
+            "hygro": "",
+            "uv": "",
         }
 
-    def _get_target_range(self, doc: _Document) -> tuple[int, int]:
-        start_idx = None
-        end_idx = None
+    # ------------------------------------------------------------------
+    # Table filler
+    # ------------------------------------------------------------------
 
-        for i, p in enumerate(doc.paragraphs):
-            text = (p.text or "").strip()
-            if start_idx is None and self.SECTION_START.lower() in text.lower():
-                start_idx = i
-            if start_idx is not None and self.SECTION_END.lower() in text.lower():
-                end_idx = i
-                break
+    def _fill_property_table(
+        self, doc: _Document, start_idx: int, end_idx: int, s13: dict[str, str]
+    ) -> None:
+        table_row_map = {
+            "ph": s13["ph"],
+            "pk": s13["pk"],
+            "pka": s13["pk"],
+            "partition coefficients": s13["partition"],
+            "melting/boiling points": s13["melting"],
+            "specific optical rotation (specify solvent)": s13["rotation"],
+            "refractive index (liquids)": s13["refractive"],
+            "hygroscopicity": s13["hygro"],
+            "uv absorption maxima/molar absorptivity": s13["uv"],
+            "other": s13["other"],
+        }
+        for table in doc.tables:
+            if not table.rows:
+                continue
+            if self._norm(table.cell(0, 0).text) != "property":
+                continue
+            for row in table.rows[1:]:
+                key = self._norm(row.cells[0].text)
+                if key in table_row_map and len(row.cells) > 1:
+                    row.cells[1].text = table_row_map[key]
 
-        if start_idx is None:
-            raise ValueError("Could not find section start in template DOCX")
-        if end_idx is None:
-            end_idx = len(doc.paragraphs)
+    # ------------------------------------------------------------------
+    # Visual formatting
+    # ------------------------------------------------------------------
 
-        return start_idx, end_idx
+    def _apply_visual_formatting(
+        self, doc: _Document, start_idx: int, end_idx: int
+    ) -> None:
+        bold_starts = {
+            "2.3.S.1 General Information",
+            "2.3.S.1.2 Structure",
+            "2.3.S.1.3 General Properties",
+        }
+        label_bold_prefixes = [
+            "(Recommended) International Non-proprietary name (INN):",
+            "Compendial name",
+            "Chemical name",
+        ]
+        for i in range(start_idx, min(end_idx, len(doc.paragraphs))):
+            p = doc.paragraphs[i]
+            t = (p.text or "").strip()
+            if any(t.startswith(s) for s in bold_starts):
+                self._set_runs_style(p, bold=True, italic=False)
+            elif t.startswith("2.3.S.1.1 Nomenclature"):
+                self._set_runs_style(p, bold=False, italic=False)
+            if any(t.startswith(lb) for lb in label_bold_prefixes):
+                self._set_runs_style(p, bold=True, italic=False)
+
+    # ------------------------------------------------------------------
+    # Public entry point
+    # ------------------------------------------------------------------
 
     def fill_s1_section(
         self,
@@ -297,40 +650,41 @@ class DocxFiller:
         output_docx: Path,
     ) -> list[str]:
         doc = Document(self.template_docx)
+        template_table_count = len(doc.tables)
         warnings: list[str] = []
 
         start_idx, end_idx = self._get_target_range(doc)
 
-        name_mfr_line = self._resolve_name_manufacturer_line()
+        name_mfr_line = self._resolve_name_manufacturer_line(
+            self.filled_reference_docx, "2.3.S.1.1 Nomenclature"
+        )
         for heading in [
             "2.3.S.1 General Information",
             "2.3.S.1.1 Nomenclature",
             "2.3.S.1.2 Structure",
             "2.3.S.1.3 General Properties",
         ]:
-            idx = self._find_para_index(doc.paragraphs, heading, start_idx, end_idx)
+            idx = self._find_para_index_doc(doc, heading, start_idx, end_idx)
             if idx is not None and name_mfr_line:
                 nxt = (doc.paragraphs[idx + 1].text or "").strip() if idx + 1 < len(doc.paragraphs) else ""
                 if not nxt.startswith("("):
                     self._insert_paragraph_after(doc.paragraphs[idx], name_mfr_line)
 
-        # Warnings are logged only, not written into DOCX.
         for refer in ["3.2.S.1.1", "3.2.S.1.2", "3.2.S.1.3"]:
-            content = extracted[refer]
-            if content.warning:
-                warnings.append(f"{refer}: {content.warning}")
+            if extracted[refer].warning:
+                warnings.append(f"{refer}: {extracted[refer].warning}")
 
         s11 = self._parse_s11(extracted["3.2.S.1.1"].raw_text)
         s12 = self._parse_s12(extracted["3.2.S.1.2"].raw_text)
         s13 = self._parse_s13(extracted["3.2.S.1.3"].raw_text)
 
-        s13_ref_idx = self._find_para_index(doc.paragraphs, "Refer Section 3.2.S.1.3", start_idx, end_idx)
+        # Insert compendial name under Refer Section 3.2.S.1.3 anchor.
+        s13_ref_idx = self._find_para_index_doc(doc, "Refer Section 3.2.S.1.3", start_idx, end_idx)
         if s13_ref_idx is not None and s11["b"]:
             nxt = (doc.paragraphs[s13_ref_idx + 1].text or "").strip() if s13_ref_idx + 1 < len(doc.paragraphs) else ""
             if nxt.lower() != s11["b"].strip().lower():
                 self._insert_paragraph_after(doc.paragraphs[s13_ref_idx], s11["b"])
 
-        # Recompute bounds because paragraph insertions above shift indices.
         start_idx, end_idx = self._get_target_range(doc)
 
         field_map = [
@@ -340,7 +694,7 @@ class DocxFiller:
             ("Company or laboratory code:", s11["d"]),
             ("Other non-proprietary name(s)", s11["e"]),
             ("Chemical Abstracts Service (CAS) registry number:", s11["f"]),
-            ("Structural formula, including relative and absolute stereochemistry:", "__STRUCTURAL_FORMULA_IMAGE__"),
+            ("Structural formula, including relative and absolute stereochemistry:", "__IMG__"),
             ("Molecular formula:", s12["b"]),
             ("Relative molecular mass:", s12["c"]),
             ("Physical description", s13["a"]),
@@ -348,43 +702,32 @@ class DocxFiller:
         ]
 
         for label, value in field_map:
-            if label in {"Solvate:", "Hydrate:"}:
-                idx = self._find_para_index_startswith(doc.paragraphs, label, start_idx, end_idx)
-            else:
-                idx = self._find_para_index(doc.paragraphs, label, start_idx, end_idx)
+            idx = self._find_para_index_doc(doc, label, start_idx, end_idx)
             if idx is None:
                 continue
-            if value == "__STRUCTURAL_FORMULA_IMAGE__":
-                image_paths = extracted["3.2.S.1.2"].image_paths
-                if image_paths:
+            if value == "__IMG__":
+                img_paths = extracted["3.2.S.1.2"].image_paths
+                if img_paths:
                     img_para = self._insert_paragraph_after(doc.paragraphs[idx], "")
-                    run = img_para.add_run()
-                    run.add_picture(str(image_paths[0]), width=Inches(5.5))
+                    self._add_picture_autofit(img_para.add_run(), img_paths[0], doc)
             else:
                 self._add_answer_after(doc, idx, value)
 
-        sol_idx = self._find_para_index(doc.paragraphs, "Solubilities:", start_idx, end_idx)
+        sol_idx = self._find_para_index_doc(doc, "Solubilities:", start_idx, end_idx)
         if sol_idx is not None:
             self._replace_paragraph_with_runs(
                 doc.paragraphs[sol_idx],
-                [
-                    ("(b)", False, False),
-                    ("\tSolubilities", False, False),
-                    (":", False, False),
-                    (" NA", False, False),
-                ],
+                [("(b)", False, False), ("\tSolubilities", False, False), (":", False, False), (" NA", False, False)],
             )
             if sol_idx + 1 < len(doc.paragraphs) and not (doc.paragraphs[sol_idx + 1].text or "").strip():
                 doc.paragraphs[sol_idx + 1].text = s13["b"]
             else:
                 self._insert_paragraph_after(doc.paragraphs[sol_idx], s13["b"])
 
-        # Force placement for physical form sub-fields into their answer lines.
         self._set_value_under_label(doc, "Polymorphic form:", s13["poly"], start_idx, end_idx)
         self._set_value_under_label(doc, "Solvate:", s13["solvate"], start_idx, end_idx)
         self._set_value_under_label(doc, "Hydrate:", s13["hydrate"], start_idx, end_idx)
 
-        # Remove template sub-labels that are not present in the reference output.
         self._remove_paragraphs_matching(
             doc,
             [
@@ -401,243 +744,593 @@ class DocxFiller:
 
         self._fill_property_table(doc, start_idx, end_idx, s13)
         self._apply_visual_formatting(doc, start_idx, end_idx)
+        cleanup_stats = _run_injected_artifact_cleanup(
+            doc, keep_first_n_tables=template_table_count
+        )
+        if any(cleanup_stats.values()):
+            warnings.append(f"cleanup: {cleanup_stats}")
 
         output_docx.parent.mkdir(parents=True, exist_ok=True)
         doc.save(output_docx)
         return warnings
 
 
-class S2DocxFiller:
+# ---------------------------------------------------------------------------
+# S2 filler — 2.3.S.2 Manufacture
+# ---------------------------------------------------------------------------
+
+class S2DocxFiller(_DocxHelper):
     SECTION_START = "2.3.S.2 Manufacture"
-    SECTION_END = "2.3.S.3 Characterisation"
+    SECTION_END   = "2.3.S.3 Characterisation"
 
-    def __init__(self, template_docx: Path, filled_reference_docx: Path | None = None) -> None:
-        self.template_docx = template_docx
+    def __init__(
+        self,
+        template_docx: Path,
+        filled_reference_docx: Path | None = None,
+        images_dir: Path | None = None,
+        s2_fill_cfg: S2FillConfig | None = None,
+        noise_cfg: NoiseConfig | None = None,
+        diagram_cfg: DiagramConfig | None = None,
+    ) -> None:
+        self.template_docx         = template_docx
         self.filled_reference_docx = filled_reference_docx
+        self.images_dir            = images_dir
+        self.cfg       = s2_fill_cfg or S2FillConfig()
+        self.noise_cfg = noise_cfg   or NoiseConfig()
+        self.diagram_cfg = diagram_cfg or DiagramConfig()
 
-    @staticmethod
-    def _norm(s: str) -> str:
-        return re.sub(r"\s+", " ", s).strip().lower()
+    # ------------------------------------------------------------------
+    # Text cleaning  (raw_text is already de-noised by extractor;
+    # this pass removes any residual section-stamp lines)
+    # ------------------------------------------------------------------
 
-    @staticmethod
-    def _find_para_index(doc: _Document, needle: str, start_idx: int, end_idx: int) -> int | None:
-        n = S2DocxFiller._norm(needle)
-        for i in range(start_idx, min(end_idx, len(doc.paragraphs))):
-            if n in S2DocxFiller._norm(doc.paragraphs[i].text or ""):
-                return i
-        return None
+    # PDF page-stamp pattern  e.g. "1 of 3" / "Page 2 of 5"
+    _PAGE_STAMP_RE = re.compile(
+        r"^(page\s*)?\d+\s+of\s+\d+$", re.IGNORECASE
+    )
 
-    def _get_target_range(self, doc: _Document) -> tuple[int, int]:
-        start_idx = None
-        end_idx = None
-        for i, p in enumerate(doc.paragraphs):
-            text = (p.text or "").strip()
-            if start_idx is None and self.SECTION_START.lower() in text.lower():
-                start_idx = i
-            if start_idx is not None and self.SECTION_END.lower() in text.lower():
-                end_idx = i
-                break
-        if start_idx is None:
-            raise ValueError("Could not find section start in template DOCX")
-        if end_idx is None:
-            end_idx = len(doc.paragraphs)
-        return start_idx, end_idx
-
-    @staticmethod
-    def _insert_after(paragraph, text: str):
-        new_p = OxmlElement("w:p")
-        paragraph._p.addnext(new_p)
-        para = Paragraph(new_p, paragraph._parent)
-        if text:
-            para.add_run(text)
-        return para
-
-    @staticmethod
-    def _delete_paragraph(paragraph) -> None:
-        element = paragraph._element
-        parent = element.getparent()
-        if parent is not None:
-            parent.remove(element)
-
-    def _remove_refer_lines(self, doc: _Document, start_idx: int, end_idx: int) -> None:
-        to_delete = []
-        for i in range(start_idx, min(end_idx, len(doc.paragraphs))):
-            t = self._norm(doc.paragraphs[i].text or "")
-            if t.startswith("refer section 3.2.s.2."):
-                to_delete.append(i)
-        for i in reversed(to_delete):
-            if i < len(doc.paragraphs):
-                self._delete_paragraph(doc.paragraphs[i])
-
-    @staticmethod
-    def _clean_text_block(text: str) -> str:
-        lines = [ln.strip() for ln in text.splitlines()]
-        out = []
-        for ln in lines:
-            if not ln:
+    def _clean_block(self, text: str) -> str:
+        out: list[str] = []
+        for ln in text.splitlines():
+            s = ln.strip()
+            if not s:
                 continue
-            low = ln.lower()
-            if low.startswith("unique pharmaceutical laboratories"):
+            low = s.lower()
+            # drop residual section-stamp lines like "3.2.S.2.1 Manufacture"
+            if re.match(r"^3\.2\.[sp]\.\d+(\.\d+)*\b", low) and len(s) < 80:
                 continue
-            if low.startswith("(a div. of"):
+            # drop PDF page numbers ("1 of 3", "Page 2 of 5")
+            if self._PAGE_STAMP_RE.match(s):
                 continue
-            if re.fullmatch(r"\d+\s+of\s+\d+", low):
-                continue
-            if "3.2.s.2" in low and ("manufacture" in low or "control" in low or "description" in low):
-                continue
-            out.append(ln)
+            out.append(s)
         return "\n".join(out).strip()
 
     @staticmethod
-    def _extract_lines(text: str) -> list[str]:
-        lines = [ln.strip() for ln in text.splitlines()]
-        return [ln for ln in lines if ln]
+    def _lines(text: str) -> list[str]:
+        return [ln.strip() for ln in text.splitlines() if ln.strip()]
+
+    # ------------------------------------------------------------------
+    # Generic manufacturer extraction (no hardcoded company names)
+    # ------------------------------------------------------------------
+
+    _PHARMA_RE = re.compile(
+        r"\b(pharmaceutical|pharma|biotech|chemical|laboratory|laboratories)\b"
+        r".*?\b(ltd|limited|inc|co\.?|corp|llc|plc|gmbh|ag|s\.a\.?)\b",
+        re.IGNORECASE,
+    )
+    _ZIP_RE = re.compile(r"\d{4,}")
+
+    _S22_KEYWORDS = {
+        "flow": (
+            "flow diagram",
+            "flow chart",
+            "synthesis process",
+        ),
+        "brief": (
+            "brief narrative",
+            "description of the manufacturing process",
+            "description of manufacturing process",
+        ),
+        "alternate": (
+            "alternate processes",
+            "alternative processes",
+        ),
+        "reprocessing": (
+            "reprocessing steps",
+            "reprocessing step",
+        ),
+    }
+
+    @classmethod
+    def _extract_s22_block(
+        cls,
+        lines: list[str],
+        start_keywords: tuple[str, ...],
+        stop_keywords: tuple[str, ...],
+    ) -> str:
+        start_idx = None
+        for i, ln in enumerate(lines):
+            low = ln.lower()
+            if any(k in low for k in start_keywords):
+                start_idx = i
+                break
+        if start_idx is None:
+            return ""
+
+        line = lines[start_idx]
+        block: list[str] = []
+        if ":" in line:
+            tail = line.split(":", 1)[1].strip()
+            if tail:
+                block.append(tail)
+
+        for ln in lines[start_idx + 1 :]:
+            low = ln.lower()
+            if any(k in low for k in stop_keywords):
+                break
+            if re.match(r"^\(?[a-d]\)?\s*[\).:-]", low):
+                if block:
+                    break
+            block.append(ln)
+
+        return " ".join(s for s in block if s).strip()
+
+    @staticmethod
+    def _derive_s22_brief_narrative(lines: list[str]) -> str:
+        """
+        Derive a narrative sentence when explicit '(b) brief narrative' label is absent.
+        Keeps logic generic and avoids product-specific hardcoding.
+        """
+        heading_re = re.compile(
+            r"^\s*3\s*[\.\-]\s*2\s*[\.\-]\s*[sp]\s*[\.\-]\s*\d+(?:\s*[\.\-]\s*\d+)*\b",
+            re.IGNORECASE,
+        )
+        stage_re = re.compile(r"^(stage|step)\b", re.IGNORECASE)
+        company_re = re.compile(r"\b(co\.?|ltd|limited|pharmaceutical|laboratories?)\b", re.IGNORECASE)
+
+        candidates: list[str] = []
+        for ln in lines:
+            s = " ".join(ln.split())
+            low = s.lower()
+            if not s:
+                continue
+            if heading_re.match(s):
+                continue
+            if low.startswith("3.2") and "description of manufacturing process" in low:
+                continue
+            if stage_re.match(low):
+                continue
+            if low.startswith("figure "):
+                continue
+            if "flow diagram" in low and len(s.split()) <= 8:
+                continue
+            if "chemical synthetical pathway" in low:
+                continue
+            if company_re.search(s) and len(s.split()) <= 10:
+                continue
+            if "  " in ln and len(s.split()) <= 5:
+                continue
+            if len(s) >= 45 and any(ch in s for ch in (".", ";", ":")):
+                candidates.append(s)
+
+        if candidates:
+            return candidates[0]
+
+        for ln in lines:
+            s = " ".join(ln.split())
+            if len(s) >= 55 and not heading_re.match(s):
+                return s
+        return ""
+
+    def _extract_s22_narrative_image(self, pdf_path: Path) -> Path | None:
+        if self.images_dir is None:
+            return None
+        out_path = self.images_dir / "3_2_S_2_2_narrative.png"
+
+        targets = (
+            "brief narrative description",
+            "description of the manufacturing process",
+            "description of manufacturing process",
+        )
+        stop_targets = (
+            "flow diagram",
+            "alternate processes",
+            "reprocessing steps",
+            "control of materials",
+        )
+
+        def drawing_clip(page: fitz.Page) -> fitz.Rect | None:
+            drawings = page.get_drawings()
+            if not drawings:
+                return None
+            union = None
+            page_rect = page.rect
+            top_cut = page_rect.y0 + page_rect.height * self.diagram_cfg.header_crop_frac
+            bottom_cut = page_rect.y1 - page_rect.height * self.diagram_cfg.footer_crop_frac
+            for drawing in drawings:
+                drect = drawing.get("rect")
+                if drect is None:
+                    continue
+                # Ignore page-spanning frame artifacts.
+                if drect.width >= page_rect.width * 0.95 or drect.height >= page_rect.height * 0.95:
+                    continue
+                if drect.y1 <= top_cut or drect.y0 >= bottom_cut:
+                    continue
+                union = drect if union is None else union | drect
+            if union is None:
+                return None
+            pad_x = max(4.0, union.width * 0.01)
+            pad_y = max(4.0, union.height * 0.01)
+            clip = fitz.Rect(union.x0 - pad_x, union.y0 - pad_y, union.x1 + pad_x, union.y1 + pad_y)
+            return clip & page.rect
+
+        def embedded_image_clip(page: fitz.Page) -> fitz.Rect | None:
+            page_rect = page.rect
+            union = None
+            try:
+                for img in page.get_images(full=True):
+                    xref = img[0]
+                    for rect in page.get_image_rects(xref):
+                        if rect.width < 24 or rect.height < 24:
+                            continue
+                        # Ignore tiny logos in header/footer strips.
+                        if rect.y1 <= page_rect.y0 + page_rect.height * self.diagram_cfg.header_crop_frac:
+                            continue
+                        if rect.y0 >= page_rect.y1 - page_rect.height * self.diagram_cfg.footer_crop_frac:
+                            continue
+                        union = rect if union is None else union | rect
+            except Exception:
+                return None
+            if union is None:
+                return None
+            pad_x = max(4.0, union.width * 0.02)
+            pad_y = max(4.0, union.height * 0.02)
+            return fitz.Rect(union.x0 - pad_x, union.y0 - pad_y, union.x1 + pad_x, union.y1 + pad_y) & page_rect
+
+        def preferred_visual_clip(page: fitz.Page, page_text_lower: str) -> fitz.Rect | None:
+            clip = embedded_image_clip(page)
+            if clip is None:
+                clip = drawing_clip(page)
+            if clip is None:
+                return None
+
+            # If a configured pathway-like keyword is present, start clip below it.
+            keyword_ys: list[float] = []
+            for kw in self.diagram_cfg.diagram_exclude_keywords:
+                if kw not in page_text_lower:
+                    continue
+                try:
+                    for r in page.search_for(kw):
+                        keyword_ys.append(r.y1)
+                except Exception:
+                    continue
+            if keyword_ys:
+                top = max(clip.y0, min(keyword_ys) + 4.0)
+                clip = fitz.Rect(clip.x0, top, clip.x1, clip.y1) & page.rect
+            return clip if clip.height > 20 and clip.width > 20 else None
+
+        def clip_visual_score(page: fitz.Page, clip: fitz.Rect) -> float:
+            """
+            Estimate whether clip contains true diagram content (not text-only blocks).
+            """
+            score = 0.0
+
+            # Embedded image evidence
+            try:
+                for img in page.get_images(full=True):
+                    xref = img[0]
+                    for rect in page.get_image_rects(xref):
+                        inter = rect & clip
+                        if inter.is_empty:
+                            continue
+                        score += max(1.0, inter.width * inter.height / 5000.0)
+            except Exception:
+                pass
+
+            # Vector drawing evidence
+            try:
+                for d in page.get_drawings():
+                    drect = d.get("rect")
+                    if drect is None:
+                        continue
+                    inter = drect & clip
+                    if inter.is_empty:
+                        continue
+                    score += 0.8
+            except Exception:
+                pass
+
+            # Penalize text-heavy regions.
+            try:
+                words = page.get_text("words", clip=clip)
+                score -= min(20.0, len(words) / 25.0)
+            except Exception:
+                pass
+
+            return score
+
+        try:
+            with fitz.open(pdf_path) as doc:
+                # Strategy 1 (preferred): pathway-like visual page.
+                best_page = None
+                best_clip = None
+                best_score = -1.0
+                for page in doc:
+                    text = page.get_text("text", sort=True)
+                    low = text.lower()
+                    if not any(kw in low for kw in self.diagram_cfg.diagram_exclude_keywords):
+                        continue
+                    clip = preferred_visual_clip(page, low)
+                    if clip is None:
+                        continue
+                    score = clip_visual_score(page, clip)
+                    if score > best_score:
+                        best_score = score
+                        best_page = page
+                        best_clip = clip
+
+                if best_page is not None and best_clip is not None and best_score > 1.5:
+                    scale = self.diagram_cfg.render_dpi_scale
+                    pix = best_page.get_pixmap(
+                        matrix=fitz.Matrix(scale, scale),
+                        clip=best_clip,
+                        alpha=False,
+                    )
+                    pix.save(str(out_path))
+                    return out_path
+
+                # Strategy 2: labeled narrative area, only if visually rich.
+                for page in doc:
+                    text = page.get_text("text", sort=True)
+                    low = text.lower()
+                    if not any(t in low for t in targets):
+                        continue
+
+                    page_rect = page.rect
+                    top_y = None
+                    for t in targets:
+                        hits = page.search_for(t)
+                        if hits:
+                            y0 = min(r.y0 for r in hits)
+                            top_y = y0 if top_y is None else min(top_y, y0)
+
+                    if top_y is None:
+                        continue
+
+                    bottom_y = None
+                    for t in stop_targets:
+                        hits = page.search_for(t)
+                        for r in hits:
+                            if r.y0 > top_y:
+                                bottom_y = r.y0 if bottom_y is None else min(bottom_y, r.y0)
+
+                    if bottom_y is None:
+                        bottom_y = page_rect.y1 - page_rect.height * 0.10
+
+                    x0 = page_rect.x0 + page_rect.width * 0.04
+                    x1 = page_rect.x1 - page_rect.width * 0.04
+                    y0 = max(page_rect.y0 + page_rect.height * 0.10, top_y - 6)
+                    y1 = min(page_rect.y1 - page_rect.height * 0.10, bottom_y + 6)
+                    if y1 - y0 < 40:
+                        continue
+
+                    clip = fitz.Rect(x0, y0, x1, y1)
+                    if clip_visual_score(page, clip) <= 1.5:
+                        continue
+                    scale = self.diagram_cfg.render_dpi_scale
+                    pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), clip=clip, alpha=False)
+                    pix.save(str(out_path))
+                    return out_path
+
+                # Final fallback: best visual clip in full section range.
+                best_page = None
+                best_clip = None
+                best_score = -1.0
+                for page in doc:
+                    low = page.get_text("text", sort=True).lower()
+                    clip = preferred_visual_clip(page, low)
+                    if clip is None:
+                        continue
+                    score = clip_visual_score(page, clip)
+                    if score > best_score:
+                        best_score = score
+                        best_page = page
+                        best_clip = clip
+
+                if best_page is not None and best_clip is not None and best_score > 1.5:
+                    scale = self.diagram_cfg.render_dpi_scale
+                    pix = best_page.get_pixmap(matrix=fitz.Matrix(scale, scale), clip=best_clip, alpha=False)
+                    pix.save(str(out_path))
+                    return out_path
+        except Exception:
+            return None
+        return None
 
     def _parse_s21(self, text: str) -> dict[str, str]:
-        lines = self._extract_lines(text)
+        lines = self._lines(self._clean_block(text))
 
-        def alpha_ratio(s: str) -> float:
-            if not s:
-                return 0.0
-            letters = sum(ch.isalpha() for ch in s)
-            return letters / max(1, len(s))
-
-        # Keep only the useful first-page narrative, exclude certificate scan noise.
-        keep = []
-        started = False
-        for ln in lines:
-            low = ln.lower()
-            if "the active drug" in low:
-                started = True
-            if started:
-                if "certificate of gmp compliance" in low:
-                    break
-                if "certificate of good manufacturing practices" in low:
-                    break
-                if re.fullmatch(r"\d+\s+of\s+\d+", low):
-                    continue
-                if low.startswith("unique pharmaceutical laboratories") or low.startswith("(a div. of"):
-                    continue
-                if alpha_ratio(ln) < 0.55:
-                    continue
-                if re.search(r"[~_\{\}\\]{2,}|\.,,", ln):
-                    continue
-                keep.append(ln)
-
-        # Extract manufacturer row fields for the first table.
-        mfr_name = ""
-        mfr_addr = ""
-        responsibility = ""
-        for i, ln in enumerate(keep):
-            low = ln.lower()
-            if "zhejiang" in low and "pharmaceutical" in low and "ltd" in low:
-                mfr_name = ln
-                # Use next 1-2 lines as address if present.
-                addr_parts = []
-                for j in range(i + 1, min(i + 4, len(keep))):
-                    if "north of" in keep[j].lower():
-                        break
-                    if "china" in keep[j].lower() or re.search(r"\b\d{5,}\b", keep[j]):
-                        addr_parts.append(keep[j])
-                        break
-                    addr_parts.append(keep[j])
-                mfr_addr = " ".join(addr_parts).strip()
-            if "manufactured, tested" in low and not responsibility:
-                responsibility = "Manufacturing, Packaging and Testing"
-
-        if not mfr_name:
-            for ln in keep:
-                low = ln.lower()
-                if "pharmaceutical" in low and "ltd" in low:
-                    mfr_name = ln
-                    break
-
-        gmp_line = ""
-        for ln in keep:
-            if "certificate of gmp compliance" in ln.lower() or "gmp" in ln.lower():
-                gmp_line = "GMP Certificate of API manufacturer is enclosed under section 3.2.S.2.1 Manufacture (s)."
+        # ── find narrative start ──────────────────────────────────────
+        start = 0
+        for i, ln in enumerate(lines):
+            if any(kw in ln.lower() for kw in self.cfg.narrative_start_keywords):
+                start = i
                 break
-        if not gmp_line:
-            gmp_line = "GMP information is provided in Module 1."
+
+        useful: list[str] = []
+        for ln in lines[start:]:
+            if any(kw in ln.lower() for kw in self.cfg.narrative_end_keywords):
+                break
+            useful.append(ln)
+
+        # ── manufacturer name ─────────────────────────────────────────
+        # Primary: regex matching common pharma-entity patterns.
+        # Fallback: any line ending with a legal-entity suffix.
+        _LEGAL_SUFFIX_RE = re.compile(
+            r"\b(ltd\.?|limited|inc\.?|co\.?|corp\.?|llc|plc|gmbh|ag|s\.a\.?)\s*$",
+            re.IGNORECASE,
+        )
+        mfr_name = ""
+        mfr_idx  = None
+        for i, ln in enumerate(useful):
+            if self._PHARMA_RE.search(ln):
+                mfr_name = ln
+                mfr_idx  = i
+                break
+        # Fallback: any line ending with a known legal suffix
+        if not mfr_name:
+            for i, ln in enumerate(useful):
+                if _LEGAL_SUFFIX_RE.search(ln) and len(ln) > 6:
+                    mfr_name = ln
+                    mfr_idx  = i
+                    break
+
+        # ── address: next 1-4 lines after manufacturer name ───────────
+        mfr_addr = ""
+        if mfr_idx is not None:
+            parts: list[str] = []
+            stop_kw = ("manufactur", "responsib", "test", "packag", "gmp")
+            for ln in useful[mfr_idx + 1 : mfr_idx + 6]:
+                low = ln.lower()
+                if any(k in low for k in stop_kw):
+                    break
+                addr_kw = ("china", "india", "japan", "germany", "france",
+                           "street", "road", "avenue", "plot", "block", "zone",
+                           "district", "province", "state", "city")
+                if re.search(r"\d", ln) or any(k in low for k in addr_kw):
+                    parts.append(ln)
+                    if self._ZIP_RE.search(ln):
+                        break
+            mfr_addr = " ".join(parts).strip()
+
+        # ── responsibility: detect from text, else fallback ───────────
+        responsibility = ""
+        for ln in useful:
+            low = ln.lower()
+            if "manufactur" in low and ("test" in low or "packag" in low):
+                responsibility = self.cfg.manufacturer_table_responsibility_default
+                break
+
+        # ── GMP statement ─────────────────────────────────────────────
+        gmp_line = ""
+        for ln in useful:
+            if any(kw in ln.lower() for kw in self.cfg.gmp_keywords):
+                gmp_line = self.cfg.gmp_found_sentence
+                break
+        gmp_line = gmp_line or self.cfg.gmp_fallback_sentence
 
         return {
-            "mfr_name": mfr_name,
-            "mfr_addr": mfr_addr,
-            "responsibility": responsibility,
-            "gmp": gmp_line,
+            "mfr_name":       mfr_name,
+            "mfr_addr":       mfr_addr,
+            "responsibility": responsibility or self.cfg.manufacturer_table_responsibility_default,
+            "gmp":            gmp_line,
         }
 
     def _parse_s22(self, text: str) -> dict[str, str]:
-        lines = self._extract_lines(text)
-        brief = ""
-        for i, ln in enumerate(lines):
-            low = ln.lower()
-            if "description of manufacturing process" in low and "enclosed" in low:
-                brief = ln
-                break
-            if "description of manufacturing process" in low and i + 1 < len(lines):
-                nxt = lines[i + 1]
-                if "manufacturer" in nxt.lower() or "open part" in nxt.lower():
-                    brief = f"{ln} {nxt}".strip()
-                    break
+        lines = self._lines(self._clean_block(text))
+
+        stop_keys = (
+            self._S22_KEYWORDS["brief"]
+            + self._S22_KEYWORDS["alternate"]
+            + self._S22_KEYWORDS["reprocessing"]
+            + self._S22_KEYWORDS["flow"]
+        )
+
+        brief = self._extract_s22_block(
+            lines,
+            self._S22_KEYWORDS["brief"],
+            stop_keys,
+        )
         if not brief:
-            # Fallback to first meaningful sentence.
-            for ln in lines:
-                low = ln.lower()
-                if low.startswith("3.2.s.2") or low.startswith("3.2. s.2"):
-                    continue
-                if "unique pharmaceutical laboratories" in low or low.startswith("(a div. of"):
-                    continue
-                brief = ln
-                break
+            brief = self._derive_s22_brief_narrative(lines)
+
+        alternate = self._extract_s22_block(
+            lines,
+            self._S22_KEYWORDS["alternate"],
+            stop_keys,
+        )
+        reprocessing = self._extract_s22_block(
+            lines,
+            self._S22_KEYWORDS["reprocessing"],
+            stop_keys,
+        )
 
         return {
-            "brief": brief,
-            "alternate": "NA",
-            "reprocessing": "NA",
+            "brief":       brief,
+            "alternate":   alternate or self.cfg.alternate_processes_default,
+            "reprocessing": reprocessing or self.cfg.reprocessing_steps_default,
         }
 
-    @staticmethod
-    def _fill_first_s21_table(doc: _Document, mfr_name: str, mfr_addr: str, responsibility: str) -> None:
+    # ------------------------------------------------------------------
+    # Table helpers
+    # ------------------------------------------------------------------
+
+    def _fill_s21_table(
+        self,
+        doc: _Document,
+        mfr_name: str,
+        mfr_addr: str,
+        responsibility: str,
+    ) -> bool:
         for table in doc.tables:
-            if len(table.rows) < 2 or len(table.columns) < 3:
+            if len(table.rows) < 2 or len(table.columns) < 2:
                 continue
-            head = " ".join((table.cell(0, c).text or "").strip().lower() for c in range(3))
+            head = " ".join(
+                (table.cell(0, c).text or "").strip().lower()
+                for c in range(min(3, len(table.columns)))
+            )
             if "name and address" in head and "responsibility" in head:
-                table.cell(1, 0).text = f"{mfr_name}\n\nAddress of Manufacturer:\n{mfr_addr}".strip()
-                table.cell(1, 1).text = responsibility or "Manufacturing, Packaging and Testing"
-                table.cell(1, 2).text = "Not applicable"
-                return
+                addr_block = mfr_name
+                if mfr_addr:
+                    addr_block += f"\n\nAddress of Manufacturer:\n{mfr_addr}"
+                table.cell(1, 0).text = addr_block.strip()
+                table.cell(1, 1).text = responsibility
+                if len(table.columns) > 2:
+                    table.cell(1, 2).text = self.cfg.manufacturer_table_apprx_col
+                return True
+        return False
+
+    # ------------------------------------------------------------------
+    # Generic helpers
+    # ------------------------------------------------------------------
 
     @staticmethod
-    def _extract_restricted_phrase(text: str) -> str:
+    def _restricted_phrase(text: str) -> str:
         for ln in text.splitlines():
             if "restricted part" in ln.lower():
                 return ln.strip()
         return ""
 
-    def _resolve_name_mfr_line(self) -> str:
-        if self.filled_reference_docx and self.filled_reference_docx.exists():
-            try:
-                ref = Document(self.filled_reference_docx)
-                for i, p in enumerate(ref.paragraphs):
-                    t = (p.text or "").strip()
-                    if "2.3.S.2.1 Manufacturer".lower() in t.lower():
-                        for j in range(i + 1, min(i + 6, len(ref.paragraphs))):
-                            cand = (ref.paragraphs[j].text or "").strip()
-                            if cand.startswith("(") and "," in cand:
-                                return cand
-            except Exception:
-                pass
-        return ""
+    def _remove_refer_section_lines(
+        self, doc: _Document, start_idx: int, end_idx: int
+    ) -> None:
+        pat = re.compile(r"^refer\s+section\s+3\.2\.[sp]\.", re.IGNORECASE)
+        to_del = [
+            i for i in range(start_idx, min(end_idx, len(doc.paragraphs)))
+            if pat.match(self._norm(doc.paragraphs[i].text or ""))
+        ]
+        for i in reversed(to_del):
+            if i < len(doc.paragraphs):
+                self._delete_paragraph(doc.paragraphs[i])
 
-    def fill_s2_section(self, extracted: dict[str, ExtractedSectionContent], output_docx: Path) -> list[str]:
-        doc = Document(self.template_docx)
+    # ------------------------------------------------------------------
+    # Public entry point
+    # ------------------------------------------------------------------
+
+    def fill_s2_section(
+        self,
+        extracted: dict[str, "ExtractedSectionContent"],
+        output_docx: Path,
+    ) -> list[str]:
+        doc      = Document(self.template_docx)
+        template_table_count = len(doc.tables)
         warnings: list[str] = []
 
         start_idx, end_idx = self._get_target_range(doc)
 
-        name_line = self._resolve_name_mfr_line()
+        # ── (drug, manufacturer) subtitle under every S2 heading ──────
+        name_line = self._resolve_name_manufacturer_line(
+            self.filled_reference_docx, "2.3.S.2.1 Manufacturer"
+        )
         for heading in [
             "2.3.S.2 Manufacture",
             "2.3.S.2.1 Manufacturer(s)",
@@ -647,106 +1340,159 @@ class S2DocxFiller:
             "2.3.S.2.5 Process Validation and/or Evaluation",
             "2.3.S.2.6 Manufacturing Process Development",
         ]:
-            idx = self._find_para_index(doc, heading, start_idx, end_idx)
+            idx = self._find_para_index_doc(doc, heading, start_idx, end_idx)
             if idx is not None and name_line:
-                nxt = (doc.paragraphs[idx + 1].text or "").strip() if idx + 1 < len(doc.paragraphs) else ""
+                nxt = (doc.paragraphs[idx + 1].text or "").strip() \
+                      if idx + 1 < len(doc.paragraphs) else ""
                 if not nxt.startswith("("):
-                    self._insert_after(doc.paragraphs[idx], name_line)
+                    self._insert_paragraph_after(doc.paragraphs[idx], name_line)
+
+        start_idx, end_idx = self._get_target_range(doc)
+        self._remove_refer_section_lines(doc, start_idx, end_idx)
+
+        # ── warnings from extractor ───────────────────────────────────
+        for k in ["3.2.S.2.1","3.2.S.2.2","3.2.S.2.3",
+                  "3.2.S.2.4","3.2.S.2.5","3.2.S.2.6"]:
+            if extracted[k].warning:
+                warnings.append(f"{k}: {extracted[k].warning}")
+
+        # ── parse ─────────────────────────────────────────────────────
+        s21 = self._parse_s21(extracted["3.2.S.2.1"].raw_text)
+        s22 = self._parse_s22(extracted["3.2.S.2.2"].raw_text)
+        s23 = self._clean_block(extracted["3.2.S.2.3"].raw_text)
+        s24 = self._clean_block(extracted["3.2.S.2.4"].raw_text)
+        s25 = self._clean_block(extracted["3.2.S.2.5"].raw_text)
+        s26 = self._clean_block(extracted["3.2.S.2.6"].raw_text)
+
+        r23 = self._restricted_phrase(s23)
+        r24 = self._restricted_phrase(s24)
+        r25 = self._restricted_phrase(s25)
+        r26 = self._restricted_phrase(s26)
 
         start_idx, end_idx = self._get_target_range(doc)
 
-        # Remove Refer Section lines from final DOCX.
-        self._remove_refer_lines(doc, start_idx, end_idx)
+        # ── 2.3.S.2.1 ────────────────────────────────────────────────
+        # _fill_s21_table searches doc.tables directly; no paragraph anchor needed.
+        filled = self._fill_s21_table(
+            doc, s21["mfr_name"], s21["mfr_addr"], s21["responsibility"]
+        )
+        if not filled:
+            warnings.append("3.2.S.2.1: manufacturer table not found in template")
 
-        # Track warnings in log only.
-        for k in ["3.2.S.2.1", "3.2.S.2.2", "3.2.S.2.3", "3.2.S.2.4", "3.2.S.2.5", "3.2.S.2.6"]:
-            c = extracted[k]
-            if c.warning:
-                warnings.append(f"{k}: {c.warning}")
-
-        s21_raw = self._clean_text_block(extracted["3.2.S.2.1"].raw_text)
-        s22_raw = self._clean_text_block(extracted["3.2.S.2.2"].raw_text)
-        s21 = self._parse_s21(s21_raw)
-        s22 = self._parse_s22(s22_raw)
-        s23 = self._clean_text_block(extracted["3.2.S.2.3"].raw_text)
-        s24 = self._clean_text_block(extracted["3.2.S.2.4"].raw_text)
-        s25 = self._clean_text_block(extracted["3.2.S.2.5"].raw_text)
-        s26 = self._clean_text_block(extracted["3.2.S.2.6"].raw_text)
-
-        restricted_23 = self._extract_restricted_phrase(s23)
-        restricted_24 = self._extract_restricted_phrase(s24)
-        restricted_25 = self._extract_restricted_phrase(s25)
-        restricted_26 = self._extract_restricted_phrase(s26)
-
-        # 2.3.S.2.1 fills
-        idx = self._find_para_index(
-            doc,
-            "Name, address, and responsibility (e.g., fabrication, packaging, labelling, testing, storage)",
-            start_idx,
-            end_idx,
+        idx = self._find_para_index_doc(
+            doc, "Manufacturing authorization for the production of API",
+            start_idx, end_idx
         )
         if idx is not None:
-            # Fill the dedicated table; avoid dumping long raw narrative here.
-            self._fill_first_s21_table(doc, s21["mfr_name"], s21["mfr_addr"], s21["responsibility"])
+            self._insert_paragraph_after(doc.paragraphs[idx], s21["gmp"])
 
-        idx = self._find_para_index(
-            doc,
-            "Manufacturing authorization for the production of API(s)",
-            start_idx,
-            end_idx,
+        # ── 2.3.S.2.2 ────────────────────────────────────────────────
+        # (a) All flow-diagram images, in document order
+        idx = self._find_para_index_doc(
+            doc, "Flow diagram of the synthesis process", start_idx, end_idx
         )
-        if idx is not None:
-            self._insert_after(doc.paragraphs[idx], s21["gmp"])
-
-        # 2.3.S.2.2 fills
-        idx = self._find_para_index(doc, "Flow diagram of the synthesis process(es):", start_idx, end_idx)
         if idx is not None and extracted["3.2.S.2.2"].image_paths:
-            p = self._insert_after(doc.paragraphs[idx], "")
-            r = p.add_run()
-            r.add_picture(str(extracted["3.2.S.2.2"].image_paths[0]), width=Inches(5.5))
+            anchor = doc.paragraphs[idx]
+            current = anchor
+            img_count = 0
+            for img_path in extracted["3.2.S.2.2"].image_paths:
+                try:
+                    img_path_obj = Path(img_path) if not isinstance(img_path, Path) else img_path
+                    if not img_path_obj.exists():
+                        warnings.append(f"3.2.S.2.2: image not found: {img_path}")
+                        continue
+                    p = self._insert_paragraph_after(current, "")
+                    run = p.add_run()
+                    self._add_picture_autofit(run, img_path, doc)
+                    current = p
+                    img_count += 1
+                except Exception as e:
+                    warnings.append(f"3.2.S.2.2: failed to insert image {img_path}: {e}")
+                    continue
+            if img_count == 0:
+                warnings.append(f"3.2.S.2.2: {len(extracted['3.2.S.2.2'].image_paths)} images found but none inserted")
+        elif idx is not None:
+            warnings.append("3.2.S.2.2: no flow-diagram images extracted")
 
-        idx = self._find_para_index(doc, "Brief narrative description of the manufacturing process(es):", start_idx, end_idx)
+        # (b) Brief narrative - prefer extracted image over text
+        idx = self._find_para_index_doc(
+            doc, "Brief narrative description of the manufacturing process",
+            start_idx, end_idx
+        )
         if idx is not None:
-            if s22["brief"]:
-                self._insert_after(doc.paragraphs[idx], s22["brief"])
+            brief = s22["brief"].strip()
+            current = doc.paragraphs[idx]
+            narrative_img = self._extract_s22_narrative_image(
+                extracted["3.2.S.2.2"].source_pdf
+            )
+            if narrative_img:
+                img_path = Path(narrative_img) if not isinstance(narrative_img, Path) else narrative_img
+                if img_path.exists():
+                    try:
+                        p = self._insert_paragraph_after(current, "")
+                        self._add_picture_autofit(p.add_run(), img_path, doc)
+                        current = p
+                    except Exception as e:
+                        warnings.append(f"3.2.S.2.2: failed to insert narrative image: {e}")
 
-        idx = self._find_para_index(doc, "Alternate processes and explanation of their use:", start_idx, end_idx)
+            if brief and len(brief) >= 30:
+                self._insert_paragraph_after(current, brief)
+            elif not narrative_img:
+                warnings.append("3.2.S.2.2: narrative text/image not found")
+
+        # (c) Alternate processes
+        idx = self._find_para_index_doc(
+            doc, "Alternate processes and explanation", start_idx, end_idx
+        )
         if idx is not None:
-            self._insert_after(doc.paragraphs[idx], s22["alternate"])
+            self._insert_paragraph_after(doc.paragraphs[idx], s22["alternate"])
 
-        idx = self._find_para_index(doc, "Reprocessing steps and justification:", start_idx, end_idx)
+        # (d) Reprocessing
+        idx = self._find_para_index_doc(
+            doc, "Reprocessing steps and justification", start_idx, end_idx
+        )
         if idx is not None:
-            self._insert_after(doc.paragraphs[idx], s22["reprocessing"])
+            self._insert_paragraph_after(doc.paragraphs[idx], s22["reprocessing"])
 
-        # 2.3.S.2.3 fills
-        idx = self._find_para_index(doc, "(a)\tName of starting material:", start_idx, end_idx)
-        if idx is not None and restricted_23:
-            self._insert_after(doc.paragraphs[idx], restricted_23)
+        # ── 2.3.S.2.3 ────────────────────────────────────────────────
+        for label in [
+            "(a)\tName of starting material:",
+            "(b)\tName and manufacturing site address of starting material",
+            "Summary of the quality and controls of the starting materials",
+            "without risk of transmitting agents of animal spongiform",
+        ]:
+            idx = self._find_para_index_doc(doc, label, start_idx, end_idx)
+            if idx is not None and r23:
+                self._insert_paragraph_after(doc.paragraphs[idx], r23)
 
-        idx = self._find_para_index(doc, "(b)\tName and manufacturing site address of starting material manufacturer(s):", start_idx, end_idx)
-        if idx is not None and restricted_23:
-            self._insert_after(doc.paragraphs[idx], restricted_23)
+        # ── 2.3.S.2.4 / 2.5 / 2.6 ───────────────────────────────────
+        idx = self._find_para_index_doc(
+            doc, "Summary of the controls performed at critical steps",
+            start_idx, end_idx
+        )
+        if idx is not None and r24:
+            self._insert_paragraph_after(doc.paragraphs[idx], r24)
 
-        idx = self._find_para_index(doc, "Summary of the quality and controls of the starting materials used in the manufacture of the API:", start_idx, end_idx)
-        if idx is not None and restricted_23:
-            self._insert_after(doc.paragraphs[idx], restricted_23)
+        idx = self._find_para_index_doc(
+            doc, "Description of process validation and/or evaluation",
+            start_idx, end_idx
+        )
+        if idx is not None and r25:
+            self._insert_paragraph_after(doc.paragraphs[idx], r25)
 
-        idx = self._find_para_index(doc, "without risk of transmitting agents of animal spongiform encephalopathies", start_idx, end_idx)
-        if idx is not None and restricted_23:
-            self._insert_after(doc.paragraphs[idx], restricted_23)
+        idx = self._find_para_index_doc(
+            doc, "Description and discussion of the significant changes",
+            start_idx, end_idx
+        )
+        if idx is not None and r26:
+            self._insert_paragraph_after(doc.paragraphs[idx], r26)
 
-        # 2.3.S.2.4 / 2.5 / 2.6 fills
-        idx = self._find_para_index(doc, "Summary of the controls performed at critical steps", start_idx, end_idx)
-        if idx is not None and restricted_24:
-            self._insert_after(doc.paragraphs[idx], restricted_24)
-
-        idx = self._find_para_index(doc, "Description of process validation and/or evaluation studies", start_idx, end_idx)
-        if idx is not None and restricted_25:
-            self._insert_after(doc.paragraphs[idx], restricted_25)
-
-        idx = self._find_para_index(doc, "Description and discussion of the significant changes made to the manufacturing process", start_idx, end_idx)
-        if idx is not None and restricted_26:
-            self._insert_after(doc.paragraphs[idx], restricted_26)
+        # ── post-processing ───────────────────────────────────────────
+        cleanup_stats = _run_injected_artifact_cleanup(
+            doc, keep_first_n_tables=template_table_count
+        )
+        if any(cleanup_stats.values()):
+            warnings.append(f"cleanup: {cleanup_stats}")
 
         output_docx.parent.mkdir(parents=True, exist_ok=True)
         doc.save(output_docx)

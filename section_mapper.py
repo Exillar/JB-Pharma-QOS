@@ -15,6 +15,9 @@ class ResolvedSection:
 
 class SectionMapper:
     CTD_PATTERN = re.compile(r"(?i)(3\.2\.[A-Z]\.\d+(?:\.\d+)*)")
+    FLEX_CTD_PATTERN = re.compile(
+        r"(?i)\b3[\s._-]*2[\s._-]*([SP])((?:[\s._-]*\d+)+)\b"
+    )
 
     def __init__(self, module3_root: Path) -> None:
         self.module3_root = module3_root
@@ -23,7 +26,18 @@ class SectionMapper:
 
     @staticmethod
     def _normalize(token: str) -> str:
-        return re.sub(r"\s+", "", token.strip().upper())
+        cleaned = re.sub(r"[\s._-]+", ".", token.strip().upper())
+        cleaned = re.sub(r"\.+", ".", cleaned).strip(".")
+        return cleaned
+
+    @classmethod
+    def _extract_flexible_sections(cls, text: str) -> set[str]:
+        sections: set[str] = set()
+        for alpha, tail in cls.FLEX_CTD_PATTERN.findall(text):
+            nums = re.findall(r"\d+", tail)
+            if nums:
+                sections.add(cls._normalize(f"3.2.{alpha}." + ".".join(nums)))
+        return sections
 
     def _build_index(self, pdfs: list[Path]) -> dict[str, list[Path]]:
         index: dict[str, list[Path]] = {}
@@ -33,6 +47,7 @@ class SectionMapper:
             matches = self.CTD_PATTERN.findall(base)
             for m in matches:
                 candidates.add(self._normalize(m))
+            candidates.update(self._extract_flexible_sections(base))
 
             # Also infer from the leading part of filename if it starts with 3.2.
             if base.upper().startswith("3.2."):
