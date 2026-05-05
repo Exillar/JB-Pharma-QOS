@@ -9,7 +9,6 @@ from pathlib import Path
 class ResolvedSection:
     refer_section: str
     resolved_pdf: Path
-    match_mode: str  # exact | fallback
     warning: str | None = None
 
 
@@ -72,7 +71,6 @@ class SectionMapper:
             return ResolvedSection(
                 refer_section=refer_section,
                 resolved_pdf=self._pick_best(exact),
-                match_mode="exact",
                 warning=None,
             )
 
@@ -88,7 +86,6 @@ class SectionMapper:
                 return ResolvedSection(
                     refer_section=refer_section,
                     resolved_pdf=chosen,
-                    match_mode="fallback",
                     warning=(
                         f"No exact PDF for {refer_section}; used fallback source {chosen.name}"
                     ),
@@ -106,7 +103,6 @@ class SectionMapper:
             return ResolvedSection(
                 refer_section=refer_section,
                 resolved_pdf=chosen,
-                match_mode="fallback",
                 warning=f"Heuristic match used for {refer_section}: {chosen.name}",
             )
 

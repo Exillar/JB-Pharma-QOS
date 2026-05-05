@@ -65,7 +65,11 @@ def _collapse_blank_paragraphs(doc: _Document) -> int:
     return len(to_remove)
 
 
-def _remove_repeated_header_paragraphs(doc: _Document) -> int:
+def _remove_repeated_header_paragraphs(
+    doc: _Document,
+    *,
+    preserve_patterns: tuple[str, ...] = (),
+) -> int:
     """
     Remove repeated short lines that are typically injected PDF headers.
     """
@@ -73,7 +77,12 @@ def _remove_repeated_header_paragraphs(doc: _Document) -> int:
 
     _NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
     freq = Counter(p.text.strip() for p in doc.paragraphs if p.text.strip())
-    noise = {t for t, c in freq.items() if c >= 3 and len(t) < 120}
+    preserve = tuple(p.lower() for p in preserve_patterns if p)
+    noise = {
+        t
+        for t, c in freq.items()
+        if c >= 3 and len(t) < 120 and not any(p in t.lower() for p in preserve)
+    }
 
     removed = 0
     for elem in list(doc.element.body):
@@ -88,7 +97,11 @@ def _remove_repeated_header_paragraphs(doc: _Document) -> int:
     return removed
 
 
-def _remove_pdf_noise_paragraphs(doc: _Document) -> int:
+def _remove_pdf_noise_paragraphs(
+    doc: _Document,
+    *,
+    preserve_phrases: tuple[str, ...] = (),
+) -> int:
     """
     Remove generic page-header/footer style paragraphs left after insertion.
     """
@@ -100,11 +113,15 @@ def _remove_pdf_noise_paragraphs(doc: _Document) -> int:
         return "".join(t.text or "" for t in e.iter(f"{{{_NS}}}t")).strip()
 
     removed = 0
+    preserve = tuple(p.lower() for p in preserve_phrases if p)
     for i, elem in enumerate(elements):
         if elem.tag.split("}")[-1] != "p":
             continue
         text = _wt(elem)
         if not text:
+            continue
+        text_lower = text.lower()
+        if preserve and any(p in text_lower for p in preserve):
             continue
 
         drop = False
@@ -211,14 +228,26 @@ def _remove_low_content_injected_tables(doc: _Document, *, keep_first_n_tables: 
     return removed
 
 
-def _run_injected_artifact_cleanup(doc: _Document, *, keep_first_n_tables: int) -> dict[str, int]:
+def _run_injected_artifact_cleanup(
+    doc: _Document,
+    *,
+    keep_first_n_tables: int,
+    preserve_repeated_patterns: tuple[str, ...] = (),
+    preserve_phrases: tuple[str, ...] = (),
+) -> dict[str, int]:
     """
     Unified cleanup pipeline for post-insertion artifacts.
     Returns per-step removal counters for debugging/telemetry.
     """
     stats = {
-        "repeated_headers_removed": _remove_repeated_header_paragraphs(doc),
-        "noise_paragraphs_removed": _remove_pdf_noise_paragraphs(doc),
+        "repeated_headers_removed": _remove_repeated_header_paragraphs(
+            doc,
+            preserve_patterns=preserve_repeated_patterns,
+        ),
+        "noise_paragraphs_removed": _remove_pdf_noise_paragraphs(
+            doc,
+            preserve_phrases=preserve_phrases,
+        ),
         "empty_tables_removed": _remove_empty_visual_tables(
             doc, keep_first_n_tables=keep_first_n_tables
         ),
@@ -589,7 +618,7 @@ class DocxFiller(_DocxHelper):
     # ------------------------------------------------------------------
 
     def _fill_property_table(
-        self, doc: _Document, start_idx: int, end_idx: int, s13: dict[str, str]
+        self, doc: _Document, s13: dict[str, str]
     ) -> None:
         table_row_map = {
             "ph": s13["ph"],
@@ -742,7 +771,7 @@ class DocxFiller(_DocxHelper):
             end_idx,
         )
 
-        self._fill_property_table(doc, start_idx, end_idx, s13)
+        self._fill_property_table(doc, s13)
         self._apply_visual_formatting(doc, start_idx, end_idx)
         cleanup_stats = _run_injected_artifact_cleanup(
             doc, keep_first_n_tables=template_table_count
@@ -1293,12 +1322,140 @@ class S2DocxFiller(_DocxHelper):
     # Generic helpers
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _restricted_phrase(text: str) -> str:
+    def _restricted_phrase(self, text: str) -> str:
+        kws = tuple(k.lower() for k in self.cfg.restricted_phrase_keywords)
         for ln in text.splitlines():
-            if "restricted part" in ln.lower():
+            low = ln.lower()
+            if any(k in low for k in kws):
                 return ln.strip()
         return ""
+
+    def _parse_s23(self, text: str) -> dict[str, str]:
+        redacted = self._restricted_phrase(text)
+        if not redacted:
+            skip_pats = (
+                re.compile(r"^3\.2\.[sp]\.2\.3\b", re.IGNORECASE),
+                re.compile(r"^refer\s+section\s+3\.2\.[sp]\.2\.3\b", re.IGNORECASE),
+                re.compile(r"^control\s+of\s+materials\b", re.IGNORECASE),
+            )
+            for ln in text.splitlines():
+                s = " ".join(ln.split()).strip()
+                if not s:
+                    continue
+                if any(p.search(s) for p in skip_pats):
+                    continue
+                redacted = s
+                break
+        return {
+            "a": redacted,
+            "b": redacted,
+            "c": redacted,
+            "d": redacted,
+            "b_inline_default": self.cfg.s23_manufacturer_not_available_default,
+        }
+
+    def _parse_generic_restricted_section(self, section_ref: str, text: str) -> dict[str, str]:
+        """
+        Generic parser for S2.x restricted-style sections (2.4, 2.5, 2.6).
+        Attempts to reuse the same heuristics as _parse_s23 without hardcoding
+        the section number.
+        Returns a dict with keys a,b,c,d and an inline default for (b).
+        """
+        redacted = self._restricted_phrase(text)
+        if not redacted:
+            # Skip common section-stamp lines and explicit refer lines for this section
+            sec_tail = section_ref.split(".")[-1]
+            try:
+                sec_num = int(sec_tail)
+                sec_re = re.compile(rf"^3\.2\.[sp]\.2\.{sec_num}\b", re.IGNORECASE)
+            except Exception:
+                sec_re = re.compile(r"^3\.2\.[sp]\.2\.[0-9]+\b", re.IGNORECASE)
+
+            refer_re = re.compile(rf"^refer\s+section\s+{re.escape(section_ref)}", re.IGNORECASE)
+
+            for ln in text.splitlines():
+                s = " ".join(ln.split()).strip()
+                if not s:
+                    continue
+                if sec_re.search(s) or refer_re.search(s) or re.search(r"control|controls|summary", s, re.IGNORECASE):
+                    # skip heading/anchor-like lines
+                    continue
+                redacted = s
+                break
+
+        return {
+            "a": redacted,
+            "b": redacted,
+            "c": redacted,
+            "d": redacted,
+            "b_inline_default": self.cfg.s23_manufacturer_not_available_default,
+        }
+
+    @staticmethod
+    def _append_inline_value_after_colon(paragraph: Paragraph, value: str) -> None:
+        if not value:
+            return
+        text = (paragraph.text or "").rstrip()
+        if not text:
+            paragraph.text = value
+            return
+        if ":" in text:
+            head, tail = text.rsplit(":", 1)
+            if tail.strip():
+                return
+            paragraph.text = f"{head}: {value}"
+            return
+        if value.lower() not in text.lower():
+            paragraph.text = f"{text} {value}".strip()
+
+    @staticmethod
+    def _normalize_s23_heading(doc: _Document, start_idx: int, end_idx: int) -> None:
+        pat = re.compile(r"^(2\.3\.S\.2\.3\s+Control of Materials)\b", re.IGNORECASE)
+        for i in range(start_idx, min(end_idx, len(doc.paragraphs))):
+            p = doc.paragraphs[i]
+            text = (p.text or "").strip()
+            m = pat.match(text)
+            if not m:
+                continue
+            canonical = m.group(1)
+            if text != canonical:
+                p.text = canonical
+            return
+
+    def _normalize_s23_table_header(self, doc: _Document) -> None:
+        target = self.cfg.s23_table_first_header_default.strip()
+        if not target:
+            return
+        for table in doc.tables:
+            if not table.rows or len(table.columns) < 3:
+                continue
+            h0 = self._norm(table.cell(0, 0).text)
+            h1 = self._norm(table.cell(0, 1).text)
+            h2 = self._norm(table.cell(0, 2).text)
+            if h0 in {"test parameter", "step / starting material"} and "test" in h1 and "acceptance criteria" in h2:
+                table.cell(0, 0).text = target
+                return
+
+    def _normalize_s2_table_header(self, doc: _Document) -> None:
+        """Normalize table headers for S2.x control-step style tables.
+        Reuses the same default header text configured for S2.3.
+        """
+        # Reuse s23 table normalization logic (generic for similar tables)
+        self._normalize_s23_table_header(doc)
+
+    def _normalize_s2_heading(self, doc: _Document, section_tail: str) -> None:
+        """Canonicalize heading like '2.3.S.2.4 ...' where section_tail is '2.4' etc."""
+        pat = re.compile(rf"^(2\.3\.S\.2\.{re.escape(section_tail)}\s+.+)$", re.IGNORECASE)
+        for i in range(0, len(doc.paragraphs)):
+            p = doc.paragraphs[i]
+            text = (p.text or "").strip()
+            m = pat.match(text)
+            if not m:
+                continue
+            canonical = m.group(1)
+            if text != canonical:
+                p.text = canonical
+            return
 
     def _remove_refer_section_lines(
         self, doc: _Document, start_idx: int, end_idx: int
@@ -1364,12 +1521,17 @@ class S2DocxFiller(_DocxHelper):
         s25 = self._clean_block(extracted["3.2.S.2.5"].raw_text)
         s26 = self._clean_block(extracted["3.2.S.2.6"].raw_text)
 
-        r23 = self._restricted_phrase(s23)
-        r24 = self._restricted_phrase(s24)
-        r25 = self._restricted_phrase(s25)
-        r26 = self._restricted_phrase(s26)
+        s23_data = self._parse_s23(s23)
+        s24_data = self._parse_generic_restricted_section("3.2.S.2.4", s24)
+        s25_data = self._parse_generic_restricted_section("3.2.S.2.5", s25)
+        s26_data = self._parse_generic_restricted_section("3.2.S.2.6", s26)
 
         start_idx, end_idx = self._get_target_range(doc)
+        self._normalize_s23_heading(doc, start_idx, end_idx)
+        # Normalize sibling S2 headings
+        self._normalize_s2_heading(doc, "2.4")
+        self._normalize_s2_heading(doc, "2.5")
+        self._normalize_s2_heading(doc, "2.6")
 
         # ── 2.3.S.2.1 ────────────────────────────────────────────────
         # _fill_s21_table searches doc.tables directly; no paragraph anchor needed.
@@ -1455,41 +1617,313 @@ class S2DocxFiller(_DocxHelper):
             self._insert_paragraph_after(doc.paragraphs[idx], s22["reprocessing"])
 
         # ── 2.3.S.2.3 ────────────────────────────────────────────────
-        for label in [
-            "(a)\tName of starting material:",
-            "(b)\tName and manufacturing site address of starting material",
-            "Summary of the quality and controls of the starting materials",
-            "without risk of transmitting agents of animal spongiform",
-        ]:
+        s23_label_map = [
+            ("(a)\tName of starting material:", "a"),
+            ("(b)\tName and manufacturing site address of starting material", "b"),
+            ("Summary of the quality and controls of the starting materials", "c"),
+            ("without risk of transmitting agents of animal spongiform", "d"),
+        ]
+        for label, key in s23_label_map:
             idx = self._find_para_index_doc(doc, label, start_idx, end_idx)
-            if idx is not None and r23:
-                self._insert_paragraph_after(doc.paragraphs[idx], r23)
+            if idx is None:
+                continue
+            if key == "b":
+                self._append_inline_value_after_colon(
+                    doc.paragraphs[idx],
+                    s23_data["b_inline_default"],
+                )
+            ans = s23_data[key].strip()
+            if ans:
+                self._insert_paragraph_after(doc.paragraphs[idx], ans)
+
+        self._normalize_s23_table_header(doc)
+
+        # Recompute section bounds after S2.3 insertions; paragraph indexes shift.
+        start_idx, end_idx = self._get_target_range(doc)
 
         # ── 2.3.S.2.4 / 2.5 / 2.6 ───────────────────────────────────
         idx = self._find_para_index_doc(
             doc, "Summary of the controls performed at critical steps",
             start_idx, end_idx
         )
-        if idx is not None and r24:
-            self._insert_paragraph_after(doc.paragraphs[idx], r24)
+        if idx is not None:
+            # Insert parsed restricted/summary text (prefer parsed a) and normalize table header
+            if s24_data.get("a"):
+                self._insert_paragraph_after(doc.paragraphs[idx], s24_data["a"]) 
+            self._normalize_s2_table_header(doc)
+
+        # Recompute bounds after S2.4 insertion because paragraph indexes shift.
+        start_idx, end_idx = self._get_target_range(doc)
 
         idx = self._find_para_index_doc(
             doc, "Description of process validation and/or evaluation",
             start_idx, end_idx
         )
-        if idx is not None and r25:
-            self._insert_paragraph_after(doc.paragraphs[idx], r25)
+        if idx is not None and s25_data.get("a"):
+            self._insert_paragraph_after(doc.paragraphs[idx], s25_data["a"])
+
+        # Recompute bounds after S2.5 insertion because paragraph indexes shift.
+        start_idx, end_idx = self._get_target_range(doc)
 
         idx = self._find_para_index_doc(
             doc, "Description and discussion of the significant changes",
             start_idx, end_idx
         )
-        if idx is not None and r26:
-            self._insert_paragraph_after(doc.paragraphs[idx], r26)
+        if idx is not None and s26_data.get("a"):
+            self._insert_paragraph_after(doc.paragraphs[idx], s26_data["a"])
 
         # ── post-processing ───────────────────────────────────────────
         cleanup_stats = _run_injected_artifact_cleanup(
-            doc, keep_first_n_tables=template_table_count
+            doc,
+            keep_first_n_tables=template_table_count,
+            preserve_repeated_patterns=self.cfg.restricted_phrase_keywords,
+        )
+        if any(cleanup_stats.values()):
+            warnings.append(f"cleanup: {cleanup_stats}")
+
+        output_docx.parent.mkdir(parents=True, exist_ok=True)
+        doc.save(output_docx)
+        return warnings
+
+
+# ---------------------------------------------------------------------------
+# S3 filler — 2.3.S.3 Characterisation
+# ---------------------------------------------------------------------------
+
+class S3DocxFiller(_DocxHelper):
+    SECTION_START = "2.3.S.3 Characterisation"
+    SECTION_END   = "2.3.S.4 Control of Drug Substance"
+
+    _PAGE_STAMP_RE = re.compile(r"^(page\s*)?\d+\s+of\s+\d+$", re.IGNORECASE)
+
+    def __init__(
+        self,
+        template_docx: Path,
+        filled_reference_docx: Path | None = None,
+        s2_fill_cfg: S2FillConfig | None = None,
+    ) -> None:
+        self.template_docx = template_docx
+        self.filled_reference_docx = filled_reference_docx
+        self.cfg = s2_fill_cfg or S2FillConfig()
+
+    def _clean_block(self, text: str) -> str:
+        out: list[str] = []
+        for ln in text.splitlines():
+            s = ln.strip()
+            if not s:
+                continue
+            if self._PAGE_STAMP_RE.match(s):
+                continue
+            out.append(s)
+        return "\n".join(out).strip()
+
+    @staticmethod
+    def _lines(text: str) -> list[str]:
+        return [ln.strip() for ln in text.splitlines() if ln.strip()]
+
+    @staticmethod
+    def _append_inline_value_after_colon(paragraph: Paragraph, value: str) -> None:
+        if not value:
+            return
+        text = (paragraph.text or "").rstrip()
+        if not text:
+            paragraph.text = value
+            return
+        if ":" in text:
+            head, tail = text.rsplit(":", 1)
+            if tail.strip():
+                return
+            paragraph.text = f"{head}: {value}"
+            return
+        if value.lower() not in text.lower():
+            paragraph.text = f"{text} {value}".strip()
+
+    @staticmethod
+    def _strip_angle_bracket_placeholder(paragraph: Paragraph) -> None:
+        text = (paragraph.text or "").strip()
+        if not text:
+            return
+        paragraph.text = re.sub(r"\s*<[^>]*>\s*$", "", text)
+
+    @staticmethod
+    def _normalize_s31_heading(doc: _Document, start_idx: int, end_idx: int) -> None:
+        for i in range(start_idx, min(end_idx, len(doc.paragraphs))):
+            p = doc.paragraphs[i]
+            text = (p.text or "").strip()
+            if "2.3.S.3.1" not in text:
+                continue
+            # Keep only heading + descriptor; remove embedded refer tail if present.
+            cleaned = re.sub(
+                r"\s*refer\s+section\s+3\.2\.[sp]\.3\.1\s*$",
+                "",
+                text,
+                flags=re.IGNORECASE,
+            ).strip()
+            if cleaned and cleaned != text:
+                p.text = cleaned
+            return
+
+    def _parse_s31(self, text: str) -> dict[str, str]:
+        lines = self._lines(self._clean_block(text))
+        low_lines = [ln.lower() for ln in lines]
+
+        start_idx = None
+        for i, low in enumerate(low_lines):
+            if any(k in low for k in self.cfg.s31_summary_start_keywords):
+                start_idx = i
+                break
+
+        summary_lines: list[str] = []
+        if start_idx is not None:
+            for ln in lines[start_idx:]:
+                low = ln.lower()
+                if any(k in low for k in self.cfg.s31_summary_stop_keywords):
+                    break
+                if re.match(r"^3\.2\.[sp]\.3(\.\d+)*\b", ln, re.IGNORECASE):
+                    if summary_lines:
+                        break
+                    continue
+                summary_lines.append(ln)
+                if len(summary_lines) >= self.cfg.s31_max_summary_lines:
+                    break
+
+        answer_a = "\n".join(summary_lines).strip()
+        if not answer_a and lines:
+            answer_a = lines[0]
+
+        # Keep (b) generic: only fill from source if explicit isomerism content exists.
+        answer_b = ""
+        answer_b = self.cfg.s31_isomerism_default
+
+        return {
+            "a": answer_a,
+            "b": answer_b,
+            "c": self.cfg.s31_polymorph_reference_default,
+            "d": self.cfg.s31_particle_size_default,
+            "e": self.cfg.s31_other_characteristics_default,
+        }
+
+    def _remove_refer_section_lines(
+        self,
+        doc: _Document,
+        start_idx: int,
+        end_idx: int,
+    ) -> None:
+        pat = re.compile(r"^refer\s+section\s+3\.2\.[sp]\.3(\.\d+)*", re.IGNORECASE)
+        to_del = [
+            i for i in range(start_idx, min(end_idx, len(doc.paragraphs)))
+            if pat.match(self._norm(doc.paragraphs[i].text or ""))
+        ]
+        for i in reversed(to_del):
+            if i < len(doc.paragraphs):
+                self._delete_paragraph(doc.paragraphs[i])
+
+    def fill_s3_section(
+        self,
+        extracted: dict[str, ExtractedSectionContent],
+        output_docx: Path,
+    ) -> list[str]:
+        doc = Document(self.template_docx)
+        template_table_count = len(doc.tables)
+        warnings: list[str] = []
+
+        start_idx, end_idx = self._get_target_range(doc)
+
+        name_line = self._resolve_name_manufacturer_line(
+            self.filled_reference_docx,
+            "2.3.S.3 Characterisation",
+        )
+        for heading in [
+            "2.3.S.3 Characterisation",
+        ]:
+            idx = self._find_para_index_doc(doc, heading, start_idx, end_idx)
+            if idx is not None and name_line:
+                nxt = (doc.paragraphs[idx + 1].text or "").strip() if idx + 1 < len(doc.paragraphs) else ""
+                if not nxt.startswith("("):
+                    self._insert_paragraph_after(doc.paragraphs[idx], name_line)
+
+        if extracted["3.2.S.3.1"].warning:
+            warnings.append(f"3.2.S.3.1: {extracted['3.2.S.3.1'].warning}")
+
+        s31 = self._parse_s31(extracted["3.2.S.3.1"].raw_text)
+
+        start_idx, end_idx = self._get_target_range(doc)
+        self._remove_refer_section_lines(doc, start_idx, end_idx)
+        self._normalize_s31_heading(doc, start_idx, end_idx)
+
+        # Remove template placeholders under (c)/(d), if present.
+        self._remove_paragraphs_matching(
+            doc,
+            [
+                "<including identification of and data on the api lot used in bioavailability studies>",
+            ],
+            start_idx,
+            end_idx,
+        )
+
+        # (a)
+        idx = self._find_para_index_doc(
+            doc,
+            "List of studies performed",
+            start_idx,
+            end_idx,
+        )
+        if idx is not None and s31["a"].strip():
+            self._insert_paragraph_after(doc.paragraphs[idx], s31["a"].strip())
+
+        # (b)
+        idx = self._find_para_index_doc(
+            doc,
+            "Discussion on the potential for isomerism",
+            start_idx,
+            end_idx,
+        )
+        if idx is not None and s31["b"].strip():
+            self._append_inline_value_after_colon(doc.paragraphs[idx], s31["b"].strip())
+
+        # (c)
+        idx = self._find_para_index_doc(
+            doc,
+            "Summary of studies performed to identify potential polymorphic forms",
+            start_idx,
+            end_idx,
+        )
+        if idx is not None and s31["c"].strip():
+            self._strip_angle_bracket_placeholder(doc.paragraphs[idx])
+            if idx + 1 < len(doc.paragraphs) and not (doc.paragraphs[idx + 1].text or "").strip():
+                doc.paragraphs[idx + 1].text = s31["c"].strip()
+            else:
+                self._insert_paragraph_after(doc.paragraphs[idx], s31["c"].strip())
+
+        # Recompute bounds after c-insertion.
+        start_idx, end_idx = self._get_target_range(doc)
+
+        # (d)
+        idx = self._find_para_index_doc(
+            doc,
+            "Summary of studies performed to identify the particle size distribution of the API:",
+            start_idx,
+            end_idx,
+        )
+        if idx is not None and s31["d"].strip():
+            self._strip_angle_bracket_placeholder(doc.paragraphs[idx])
+            self._append_inline_value_after_colon(doc.paragraphs[idx], s31["d"].strip())
+
+        # (e)
+        idx = self._find_para_index_doc(
+            doc,
+            "Other characteristics:",
+            start_idx,
+            end_idx,
+        )
+        if idx is not None and s31["e"].strip():
+            self._append_inline_value_after_colon(doc.paragraphs[idx], s31["e"].strip())
+
+        cleanup_stats = _run_injected_artifact_cleanup(
+            doc,
+            keep_first_n_tables=template_table_count,
+            preserve_repeated_patterns=self.cfg.restricted_phrase_keywords,
+            preserve_phrases=(s31["c"],),
         )
         if any(cleanup_stats.values()):
             warnings.append(f"cleanup: {cleanup_stats}")
