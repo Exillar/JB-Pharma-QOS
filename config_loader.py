@@ -15,9 +15,9 @@ import yaml
 class DiagramConfig:
     """Controls how vector-drawn flow-diagram pages are detected and rendered.
 
-    All defaults reproduce the empirically-calibrated values for the Cardiolek
-    dossier.  Override in config.yaml under the ``diagram:`` key if a new
-    dossier has different header/footer heights or drawing densities.
+    Defaults are generic and should work for common CTD-style dossiers.
+    Override in config.yaml under the ``diagram:`` key when a dossier has
+    different header/footer heights or drawing densities.
     """
 
     # Sections whose diagrams are purely vector-drawn (no embedded XREFs).
@@ -87,10 +87,7 @@ class NoiseConfig:
     """
 
     # Line-prefix strings that should always be suppressed (case-insensitive).
-    company_name_prefixes: tuple[str, ...] = (
-        "unique pharmaceutical laboratories",
-        "(a div. of",
-    )
+    company_name_prefixes: tuple[str, ...] = ()
 
     # Minimum number of pages a string must appear on to be auto-detected as
     # header/footer noise (mirrors the QIS _build_noise_blocklist threshold).
@@ -135,6 +132,20 @@ class S2FillConfig:
         "gmp",
     )
 
+    # Generic confidentiality cues seen in S2.3-S2.6 text.
+    # First line matching any keyword is reused where section text is redacted.
+    restricted_phrase_keywords: tuple[str, ...] = (
+        "restricted part",
+        "drug master file",
+        "confidential",
+    )
+
+    # 2.3.S.2.3 inline fallback next to point (b) manufacturer-address label.
+    s23_manufacturer_not_available_default: str = "NA"
+
+    # 2.3.S.2.3 first table header normalization.
+    s23_table_first_header_default: str = "Step / Starting Material"
+
     # Keywords used to detect that source text is the main narrative
     # (as opposed to certificate scan noise, table-of-contents lines, etc.)
     narrative_start_keywords: tuple[str, ...] = ("the active drug",)
@@ -144,6 +155,22 @@ class S2FillConfig:
         "certificate of gmp compliance",
         "certificate of good manufacturing practices",
     )
+
+    # 2.3.S.3.1 parsing controls and defaults
+    s31_summary_start_keywords: tuple[str, ...] = (
+        "the structural elucidation",
+        "elucidation of structure",
+    )
+    s31_summary_stop_keywords: tuple[str, ...] = (
+        "for details of elucidation of structure",
+        "3.2.s.3 ",
+        "3.2.s.3.1.1",
+    )
+    s31_max_summary_lines: int = 14
+    s31_isomerism_default: str = "NA"
+    s31_polymorph_reference_default: str = "Refer to Module 3 Section 3.2.S.3.1 for details."
+    s31_particle_size_default: str = "NA"
+    s31_other_characteristics_default: str = "NA"
 
 
 # ---------------------------------------------------------------------------
@@ -335,11 +362,62 @@ class ConfigLoader:
                 raw.get("gmp_fallback_sentence", defaults.gmp_fallback_sentence)
             ),
             gmp_keywords=tuple(raw.get("gmp_keywords", list(defaults.gmp_keywords))),
+            restricted_phrase_keywords=tuple(
+                raw.get("restricted_phrase_keywords", list(defaults.restricted_phrase_keywords))
+            ),
+            s23_manufacturer_not_available_default=str(
+                raw.get(
+                    "s23_manufacturer_not_available_default",
+                    defaults.s23_manufacturer_not_available_default,
+                )
+            ),
+            s23_table_first_header_default=str(
+                raw.get(
+                    "s23_table_first_header_default",
+                    defaults.s23_table_first_header_default,
+                )
+            ),
             narrative_start_keywords=tuple(
                 raw.get("narrative_start_keywords", list(defaults.narrative_start_keywords))
             ),
             narrative_end_keywords=tuple(
                 raw.get("narrative_end_keywords", list(defaults.narrative_end_keywords))
+            ),
+            s31_summary_start_keywords=tuple(
+                raw.get(
+                    "s31_summary_start_keywords",
+                    list(defaults.s31_summary_start_keywords),
+                )
+            ),
+            s31_summary_stop_keywords=tuple(
+                raw.get(
+                    "s31_summary_stop_keywords",
+                    list(defaults.s31_summary_stop_keywords),
+                )
+            ),
+            s31_max_summary_lines=int(
+                raw.get("s31_max_summary_lines", defaults.s31_max_summary_lines)
+            ),
+            s31_isomerism_default=str(
+                raw.get("s31_isomerism_default", defaults.s31_isomerism_default)
+            ),
+            s31_polymorph_reference_default=str(
+                raw.get(
+                    "s31_polymorph_reference_default",
+                    defaults.s31_polymorph_reference_default,
+                )
+            ),
+            s31_particle_size_default=str(
+                raw.get(
+                    "s31_particle_size_default",
+                    defaults.s31_particle_size_default,
+                )
+            ),
+            s31_other_characteristics_default=str(
+                raw.get(
+                    "s31_other_characteristics_default",
+                    defaults.s31_other_characteristics_default,
+                )
             ),
         )
 

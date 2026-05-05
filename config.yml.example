@@ -9,3 +9,22 @@ dossier_root: ./inputs/Cardiolek
 filled_reference_docx: ./inputs/Quality Overall Summary_QOS.docx
 output_docx: ./outputs/Quality Overall Summary_QOS_2.3.S.1_Auto.docx
 artifacts_dir: ./artifacts
+
+s2_fill:
+	restricted_phrase_keywords:
+		- restricted part
+		- drug master file
+		- confidential
+	s23_manufacturer_not_available_default: "NA"
+	s23_table_first_header_default: "Step / Starting Material"
+	s31_summary_start_keywords:
+		- the structural elucidation
+		- elucidation of structure
+	s31_summary_stop_keywords:
+		- for details of elucidation of structure
+		- 3.2.s.3.1.1
+	s31_max_summary_lines: 14
+	s31_isomerism_default: "NA"
+	s31_polymorph_reference_default: "Refer to Module 3 Section 3.2.S.3.1 for details."
+	s31_particle_size_default: "NA"
+	s31_other_characteristics_default: "NA"

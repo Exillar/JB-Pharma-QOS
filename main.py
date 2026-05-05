@@ -7,7 +7,7 @@ from typing import Callable
 import shutil
 
 from config_loader import AppConfig, ConfigLoader, PipelineConfig
-from docx_builder import DocxFiller, S2DocxFiller
+from docx_builder import DocxFiller, S2DocxFiller, S3DocxFiller
 from pdf_extractor import ExtractedSectionContent, PdfSectionExtractor
 from section_mapper import SectionMapper
 from verifier import SectionVerifier
@@ -17,7 +17,7 @@ from verifier import SectionVerifier
 class SectionSpec:
     refer_sections: list[str]
     filler_factory: Callable[[PipelineConfig], object]
-    fill_method: str
+    fill_runner: Callable[[object, dict[str, ExtractedSectionContent], Path], list[str]]
     start_label: str
     end_label: str
     log_title: str
@@ -31,7 +31,7 @@ class QosPipeline:
                 cfg.template_docx,
                 cfg.filled_reference_docx,
             ),
-            fill_method="fill_s1_section",
+            fill_runner=lambda filler, payload, out: filler.fill_s1_section(payload, out),
             start_label="2.3.S.1 General Information",
             end_label="2.3.S.2 Manufacture",
             log_title="QOS 2.3.S.1 generation warnings",
@@ -53,10 +53,22 @@ class QosPipeline:
                 noise_cfg=cfg.noise,
                 diagram_cfg=cfg.diagram,
             ),
-            fill_method="fill_s2_section",
+            fill_runner=lambda filler, payload, out: filler.fill_s2_section(payload, out),
             start_label="2.3.S.2 Manufacture",
             end_label="2.3.S.3 Characterisation",
             log_title="QOS 2.3.S.2 generation warnings",
+        ),
+        "s3": SectionSpec(
+            refer_sections=["3.2.S.3.1"],
+            filler_factory=lambda cfg: S3DocxFiller(
+                cfg.template_docx,
+                cfg.filled_reference_docx,
+                s2_fill_cfg=cfg.s2_fill,
+            ),
+            fill_runner=lambda filler, payload, out: filler.fill_s3_section(payload, out),
+            start_label="2.3.S.3 Characterisation",
+            end_label="2.3.S.4 Control of Drug Substance",
+            log_title="QOS 2.3.S.3 generation warnings",
         ),
     }
 
@@ -95,15 +107,13 @@ class QosPipeline:
 
         output_docx = self.config.output_docx
         try:
-            fill = getattr(filler, spec.fill_method)
-            docx_warnings = fill(extracted_payload, output_docx)
+            docx_warnings = spec.fill_runner(filler, extracted_payload, output_docx)
         except PermissionError:
             from datetime import datetime
 
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             alt = output_docx.with_name(f"{output_docx.stem}_{stamp}{output_docx.suffix}")
-            fill = getattr(filler, spec.fill_method)
-            docx_warnings = fill(extracted_payload, alt)
+            docx_warnings = spec.fill_runner(filler, extracted_payload, alt)
             output_docx = alt
         warnings.extend(docx_warnings)
 
@@ -148,7 +158,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to YAML config (defaults to ./config.yaml)",
     )
     parser.add_argument("--template", default=None, help="Path to Quality Overall Summary template DOCX")
-    parser.add_argument("--dossier-root", default=None, help="Path to dossier root folder (e.g., Cardiolek)")
+    parser.add_argument("--dossier-root", default=None, help="Path to dossier root folder")
     parser.add_argument("--filled-reference", default=None, help="Path to already-filled QOS DOCX for verification")
     parser.add_argument("--output", default=None, help="Output DOCX path")
     parser.add_argument(
@@ -165,7 +175,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--section",
         default=None,
-        choices=["s1", "s2", "all"],
+        choices=["s1", "s2", "s3", "all"],
         help="QOS section automation target",
     )
     return parser
@@ -218,6 +228,7 @@ def main() -> None:
 
     if app_config.section == "all":
         intermediate = app_config.artifacts_dir / "qos_s1_intermediate.docx"
+        intermediate_s2 = app_config.artifacts_dir / "qos_s2_intermediate.docx"
         first_result = run_section(
             "s1",
             app_config.template_docx,
@@ -228,22 +239,33 @@ def main() -> None:
         second_result = run_section(
             "s2",
             intermediate,
-            app_config.output_docx,
+            intermediate_s2,
             verification_report_name="verification_report_part_b.txt",
             generation_log_name="generation_part_b.log",
+        )
+        third_result = run_section(
+            "s3",
+            intermediate_s2,
+            app_config.output_docx,
+            verification_report_name="verification_report_part_c.txt",
+            generation_log_name="generation_part_c.log",
         )
 
         cleanup_images_dir()
 
         print("=== QOS ALL Generation Summary ===")
         print(f"Intermediate DOCX: {first_result.output_docx}")
-        print(f"Final Output DOCX: {second_result.output_docx}")
+        print(f"Intermediate S2 DOCX: {second_result.output_docx}")
+        print(f"Final Output DOCX: {third_result.output_docx}")
         print(f"Verification report (part A): {first_result.verification_report}")
         print(f"Verification report (part B): {second_result.verification_report}")
+        print(f"Verification report (part C): {third_result.verification_report}")
         print("Warnings:")
         for warning in first_result.warnings:
             print(f"- {warning}")
         for warning in second_result.warnings:
+            print(f"- {warning}")
+        for warning in third_result.warnings:
             print(f"- {warning}")
     else:
         result = run_section(app_config.section, app_config.template_docx, app_config.output_docx)
