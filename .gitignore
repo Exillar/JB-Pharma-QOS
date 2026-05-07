@@ -28,3 +28,5 @@ _patch.py
 
 # Local nested project clone
 JB-Pharma-QIS/
+
+*.yaml

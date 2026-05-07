@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
-import shutil
 
 from config_loader import AppConfig, ConfigLoader, PipelineConfig
-from docx_builder import DocxFiller, S2DocxFiller, S3DocxFiller
+from docx_builder import DocxFiller, S2DocxFiller, S3DocxFiller, S4DocxFiller
 from pdf_extractor import ExtractedSectionContent, PdfSectionExtractor
 from section_mapper import SectionMapper
 from verifier import SectionVerifier
@@ -70,6 +70,17 @@ class QosPipeline:
             end_label="2.3.S.4 Control of Drug Substance",
             log_title="QOS 2.3.S.3 generation warnings",
         ),
+        "s4": SectionSpec(
+            refer_sections=["3.2.S.4.1", "3.2.S.4.2"],
+            filler_factory=lambda cfg: S4DocxFiller(
+                cfg.template_docx,
+                cfg.filled_reference_docx,
+            ),
+            fill_runner=lambda filler, payload, out: filler.fill_s4_section(payload, out),
+            start_label="2.3.S.4 Control of the API",
+            end_label="2.3.S.5 Reference Standards or Materials",
+            log_title="QOS 2.3.S.4 generation warnings",
+        ),
     }
 
     def __init__(self, config: PipelineConfig, section: str) -> None:
@@ -92,6 +103,7 @@ class QosPipeline:
             )
         else:
             raise ValueError(f"Unsupported extractor backend: {self.config.extractor_backend}")
+
         filler = spec.filler_factory(self.config)
         verifier = SectionVerifier()
 
@@ -163,19 +175,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", default=None, help="Output DOCX path")
     parser.add_argument(
         "--artifacts-dir",
-        default=None,
+        default="",
         help="Artifacts folder for images and reports",
     )
     parser.add_argument(
         "--backend",
-        default=None,
-        choices=["pymupdf"],
+        default="",
+        choices=["", "pymupdf"],
         help="Extraction backend",
     )
     parser.add_argument(
         "--section",
-        default=None,
-        choices=["s1", "s2", "s3", "all"],
+        default="",
+        choices=["", "s1", "s2", "s3", "s4", "all"],
         help="QOS section automation target",
     )
     return parser
@@ -227,45 +239,52 @@ def main() -> None:
         return pipeline.run()
 
     if app_config.section == "all":
-        intermediate = app_config.artifacts_dir / "qos_s1_intermediate.docx"
+        intermediate_s1 = app_config.artifacts_dir / "qos_s1_intermediate.docx"
         intermediate_s2 = app_config.artifacts_dir / "qos_s2_intermediate.docx"
-        first_result = run_section(
+        intermediate_s3 = app_config.artifacts_dir / "qos_s3_intermediate.docx"
+
+        result_s1 = run_section(
             "s1",
             app_config.template_docx,
-            intermediate,
+            intermediate_s1,
             verification_report_name="verification_report_part_a.txt",
             generation_log_name="generation_part_a.log",
         )
-        second_result = run_section(
+        result_s2 = run_section(
             "s2",
-            intermediate,
+            intermediate_s1,
             intermediate_s2,
             verification_report_name="verification_report_part_b.txt",
             generation_log_name="generation_part_b.log",
         )
-        third_result = run_section(
+        result_s3 = run_section(
             "s3",
             intermediate_s2,
-            app_config.output_docx,
+            intermediate_s3,
             verification_report_name="verification_report_part_c.txt",
             generation_log_name="generation_part_c.log",
+        )
+        result_s4 = run_section(
+            "s4",
+            intermediate_s3,
+            app_config.output_docx,
+            verification_report_name="verification_report_part_d.txt",
+            generation_log_name="generation_part_d.log",
         )
 
         cleanup_images_dir()
 
         print("=== QOS ALL Generation Summary ===")
-        print(f"Intermediate DOCX: {first_result.output_docx}")
-        print(f"Intermediate S2 DOCX: {second_result.output_docx}")
-        print(f"Final Output DOCX: {third_result.output_docx}")
-        print(f"Verification report (part A): {first_result.verification_report}")
-        print(f"Verification report (part B): {second_result.verification_report}")
-        print(f"Verification report (part C): {third_result.verification_report}")
+        print(f"Intermediate S1 DOCX: {result_s1.output_docx}")
+        print(f"Intermediate S2 DOCX: {result_s2.output_docx}")
+        print(f"Intermediate S3 DOCX: {result_s3.output_docx}")
+        print(f"Final Output DOCX: {result_s4.output_docx}")
+        print(f"Verification report (part A): {result_s1.verification_report}")
+        print(f"Verification report (part B): {result_s2.verification_report}")
+        print(f"Verification report (part C): {result_s3.verification_report}")
+        print(f"Verification report (part D): {result_s4.verification_report}")
         print("Warnings:")
-        for warning in first_result.warnings:
-            print(f"- {warning}")
-        for warning in second_result.warnings:
-            print(f"- {warning}")
-        for warning in third_result.warnings:
+        for warning in result_s1.warnings + result_s2.warnings + result_s3.warnings + result_s4.warnings:
             print(f"- {warning}")
     else:
         result = run_section(app_config.section, app_config.template_docx, app_config.output_docx)
