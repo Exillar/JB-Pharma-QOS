@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterable
 
 
 @dataclass(frozen=True)
@@ -22,6 +23,7 @@ class SectionMapper:
         self.module3_root = module3_root
         self._pdfs = list(module3_root.rglob("*.pdf"))
         self._index = self._build_index(self._pdfs)
+        self._content_index: dict[str, list[Path]] = {}
 
     @staticmethod
     def _normalize(token: str) -> str:
@@ -64,6 +66,48 @@ class SectionMapper:
         sorted_candidates = sorted(candidates, key=lambda p: (len(p.stem), str(p).lower()))
         return sorted_candidates[0]
 
+    @staticmethod
+    def _section_flexible_regex(section: str) -> re.Pattern[str]:
+        parts = [re.escape(p) for p in section.split(".") if p]
+        if not parts:
+            return re.compile(re.escape(section), re.IGNORECASE)
+        pat = r"\b" + r"\s*[\.\s_\-]\s*".join(parts) + r"\b"
+        return re.compile(pat, re.IGNORECASE)
+
+    def _pdf_contains_section(self, pdf: Path, section_re: re.Pattern[str], *, max_pages: int = 3) -> bool:
+        try:
+            import fitz  # PyMuPDF
+        except Exception:
+            return False
+
+        try:
+            with fitz.open(pdf) as doc:
+                limit = min(max_pages, doc.page_count)
+                for i in range(limit):
+                    try:
+                        text = doc.load_page(i).get_text("text", sort=True)
+                    except Exception:
+                        continue
+                    if section_re.search(text):
+                        return True
+        except Exception:
+            return False
+        return False
+
+    def _content_scan(self, refer_section: str) -> list[Path]:
+        key = self._normalize(refer_section)
+        cached = self._content_index.get(key)
+        if cached is not None:
+            return cached
+
+        section_re = self._section_flexible_regex(key)
+        hits: list[Path] = []
+        for pdf in self._pdfs:
+            if self._pdf_contains_section(pdf, section_re):
+                hits.append(pdf)
+        self._content_index[key] = hits
+        return hits
+
     def resolve(self, refer_section: str) -> ResolvedSection:
         normalized = self._normalize(refer_section)
         exact = self._index.get(normalized)
@@ -104,6 +148,16 @@ class SectionMapper:
                 refer_section=refer_section,
                 resolved_pdf=chosen,
                 warning=f"Heuristic match used for {refer_section}: {chosen.name}",
+            )
+
+        # Last-resort: scan PDF content for the section anchor (robust to poor filenames).
+        scanned = self._content_scan(refer_section)
+        if scanned:
+            chosen = self._pick_best(scanned)
+            return ResolvedSection(
+                refer_section=refer_section,
+                resolved_pdf=chosen,
+                warning=f"Content-scan match used for {refer_section}: {chosen.name}",
             )
 
         raise FileNotFoundError(f"Unable to map refer section: {refer_section}")

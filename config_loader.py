@@ -233,7 +233,13 @@ class PipelineConfig:
 
     @property
     def module3_root(self) -> Path:
-        return self.dossier_root / "Module 3"
+        # Some deployments point dossier_root at the dossier root (which contains "Module 3"),
+        # while others point dossier_root directly at the "Module 3" folder itself.
+        direct = self.dossier_root
+        nested = self.dossier_root / "Module 3"
+        if nested.exists():
+            return nested
+        return direct
 
     @property
     def image_artifacts_dir(self) -> Path:
@@ -250,7 +256,12 @@ class PipelineConfig:
     def ensure_directories(self) -> None:
         self.artifacts_dir.mkdir(parents=True, exist_ok=True)
         self.image_artifacts_dir.mkdir(parents=True, exist_ok=True)
-        self.output_docx.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            self.output_docx.parent.mkdir(parents=True, exist_ok=True)
+        except PermissionError:
+            # Output folder may be locked down (e.g., OneDrive / corporate paths).
+            # The pipeline will fallback to a writable alternate output path.
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -430,9 +441,18 @@ class ConfigLoader:
         return data
 
     @staticmethod
+    def _clean_path_str(val: object) -> str:
+        s = str(val).strip()
+        # YAML already parses quoted scalars, but users sometimes include literal quotes
+        # inside the value, e.g. '"D:\\path\\file.docx"'. Strip one wrapping layer.
+        if (len(s) >= 2) and ((s[0] == s[-1]) and s[0] in ("'", '"')):
+            s = s[1:-1].strip()
+        return s
+
+    @staticmethod
     def _resolve_path(data: dict[str, Any], key: str, base_dir: Path) -> Path:
         val = data.get(key)
         if not val:
             raise ValueError(f"Missing required config key: {key}")
-        path = Path(str(val))
+        path = Path(ConfigLoader._clean_path_str(val))
         return path if path.is_absolute() else (base_dir / path).resolve()

@@ -3,8 +3,8 @@
 
 section: all
 extractor_backend: pymupdf
-template_docx: 'C:\Users\exill\OneDrive - Exillar\Desktop\Projects\JB Pharma\Tagging- mapping logic\Tagging- mapping logic\Quality Overall Summary.docx'
-dossier_root: 'C:\Users\exill\OneDrive - Exillar\Desktop\Projects\JB Pharma\Cardiolek'
-filled_reference_docx: 'C:\Users\exill\OneDrive - Exillar\Desktop\Projects\JB Pharma\Cardiolek\Quality Overall Summary_QOS.docx'
-output_docx: 'C:\Users\exill\OneDrive - Exillar\Desktop\Projects\JB Pharma\Cardiolek\QOS\Output\Output_QOS.docx'
-artifacts_dir: 'C:\Users\exill\OneDrive - Exillar\Desktop\Projects\JB Pharma\Cardiolek\QOS\logger'
+template_docx: '"D:\JB Pharma internal\JB Pharma\Tagging- mapping logic\Tagging- mapping logic\Quality Overall Summary.docx"'
+dossier_root: '"D:\JB Pharma internal\JB Pharma\Cardiolek"'
+filled_reference_docx: '"D:\JB Pharma internal\JB Pharma\Cardiolek\Quality Overall Summary_QOS.docx"'
+output_docx: '"D:\JB Pharma internal\JB Pharma\Cardiolek\QOS\Output\Output_QOS.docx"'
+artifacts_dir: '"D:\JB Pharma internal\JB Pharma\Cardiolek"'
