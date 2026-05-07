@@ -1931,3 +1931,677 @@ class S3DocxFiller(_DocxHelper):
         output_docx.parent.mkdir(parents=True, exist_ok=True)
         doc.save(output_docx)
         return warnings
+
+
+class S4DocxFiller:
+    SECTION_START = "2.3.S.4 Control of the API"
+    SECTION_END = "2.3.S.5 Reference Standards or Materials"
+
+    def __init__(self, template_docx: Path, filled_reference_docx: Path | None = None) -> None:
+        self.template_docx = template_docx
+        self.filled_reference_docx = filled_reference_docx
+
+    @staticmethod
+    def _norm(s: str) -> str:
+        return re.sub(r"\s+", " ", s).strip().lower()
+
+    @staticmethod
+    def _clean_cell(text: str) -> str:
+        return re.sub(r"\s+", " ", (text or "").strip())
+
+    def _get_target_range(self, doc: _Document) -> tuple[int, int]:
+        start_idx = None
+        end_idx = None
+        for i, p in enumerate(doc.paragraphs):
+            text = (p.text or "").strip()
+            if start_idx is None and self.SECTION_START.lower() in text.lower():
+                start_idx = i
+            if start_idx is not None and self.SECTION_END.lower() in text.lower():
+                end_idx = i
+                break
+        if start_idx is None:
+            raise ValueError("Could not find section start in template DOCX")
+        if end_idx is None:
+            end_idx = len(doc.paragraphs)
+        return start_idx, end_idx
+
+    def _find_para_index(self, doc: _Document, needle: str, start_idx: int, end_idx: int) -> int | None:
+        target = self._norm(needle)
+        for i in range(start_idx, min(end_idx, len(doc.paragraphs))):
+            if target in self._norm(doc.paragraphs[i].text or ""):
+                return i
+        return None
+
+    @staticmethod
+    def _insert_after(paragraph: Paragraph, text: str = "") -> Paragraph:
+        new_p = OxmlElement("w:p")
+        paragraph._p.addnext(new_p)
+        para = Paragraph(new_p, paragraph._parent)
+        if text:
+            para.add_run(text)
+        return para
+
+    @staticmethod
+    def _delete_paragraph(paragraph: Paragraph) -> None:
+        element = paragraph._element
+        parent = element.getparent()
+        if parent is not None:
+            parent.remove(element)
+
+    def _remove_refer_lines(self, doc: _Document, start_idx: int, end_idx: int) -> None:
+        to_delete: list[int] = []
+        for i in range(start_idx, min(end_idx, len(doc.paragraphs))):
+            text = self._norm(doc.paragraphs[i].text or "")
+            if text.startswith("refer section 3.2.s.4."):
+                to_delete.append(i)
+        for idx in reversed(to_delete):
+            if idx < len(doc.paragraphs):
+                self._delete_paragraph(doc.paragraphs[idx])
+
+    def _resolve_heading_line(self, heading: str) -> str:
+        if self.filled_reference_docx and self.filled_reference_docx.exists():
+            try:
+                ref = Document(self.filled_reference_docx)
+                for i, p in enumerate(ref.paragraphs):
+                    text = self._norm(p.text or "")
+                    if self._norm(heading) in text:
+                        for j in range(i + 1, min(i + 6, len(ref.paragraphs))):
+                            candidate = (ref.paragraphs[j].text or "").strip()
+                            if candidate.startswith("(") and "," in candidate:
+                                return candidate
+            except Exception:
+                pass
+        return ""
+
+    def _insert_heading_line_if_missing(
+        self,
+        doc: _Document,
+        heading: str,
+        name_line: str,
+        start_idx: int,
+        end_idx: int,
+    ) -> None:
+        if not name_line:
+            return
+        idx = self._find_para_index(doc, heading, start_idx, end_idx)
+        if idx is None:
+            return
+        next_text = (doc.paragraphs[idx + 1].text or "").strip() if idx + 1 < len(doc.paragraphs) else ""
+        if not next_text.startswith("("):
+            self._insert_after(doc.paragraphs[idx], name_line)
+
+    def _set_paragraph_text_with_suffix(self, doc: _Document, needle: str, suffix: str, start_idx: int, end_idx: int) -> None:
+        idx = self._find_para_index(doc, needle, start_idx, end_idx)
+        if idx is None:
+            return
+        paragraph = doc.paragraphs[idx]
+        base = (paragraph.text or "").strip()
+        if not base:
+            return
+        base = re.sub(r"\s+", " ", base)
+
+        for run in list(paragraph.runs):
+            paragraph._p.remove(run._r)
+
+        q_run = paragraph.add_run(base)
+        q_run.bold = True
+        q_run.italic = False
+
+        a_run = paragraph.add_run(f" {suffix}".rstrip())
+        a_run.bold = False
+        a_run.italic = False
+
+    def _find_s41_template_table(self, doc: _Document) -> object | None:
+        for table in doc.tables:
+            if len(table.columns) != 3 or len(table.rows) < 8:
+                continue
+            row0 = [self._norm(c.text) for c in table.rows[0].cells[:3]]
+            row2 = [self._norm(c.text) for c in table.rows[2].cells[:3]]
+            sample = [self._norm(table.rows[i].cells[0].text) for i in range(3, min(len(table.rows), 8))]
+            if (
+                row0[0].startswith("standard")
+                and row2[0] == "test"
+                and "acceptance criteria" in row2[1]
+                and "analytical procedure" in row2[2]
+                and sample[:5] == ["description", "identification", "impurities", "assay", "etc."]
+            ):
+                return table
+        return None
+
+    def _choose_s41_source_table(self, content: ExtractedSectionContent) -> list[list[str]]:
+        best_score = -1
+        best_table: list[list[str]] = []
+        caption_hit = bool(re.search(r"\btable\s+\d+.*\bspecification", content.raw_text, flags=re.IGNORECASE))
+
+        for table in content.tables:
+            flat = " ".join(self._clean_cell(cell) for row in table for cell in row)
+            flat_low = flat.lower()
+            score = 0
+            if "acceptance criteria" in flat_low:
+                score += 5
+            if "analytical procedure" in flat_low:
+                score += 4
+            elif "method" in flat_low:
+                score += 3
+            if re.search(r"\btest\b", flat_low):
+                score += 3
+            if "specification" in flat_low or "specifications" in flat_low:
+                score += 2
+            if caption_hit:
+                score += 1
+            if score > best_score:
+                best_score = score
+                best_table = table
+
+        return best_table if best_score >= 8 else []
+
+    def _extract_s41_metadata_and_rows(
+        self,
+        content: ExtractedSectionContent,
+    ) -> tuple[str, str, list[list[str]]]:
+        raw_source_rows = self._extract_s41_source_rows_from_pdf_tables(content.source_pdf)
+        if raw_source_rows:
+            normalized_rows = [[test, acceptance, method] for test, method, acceptance in raw_source_rows]
+            return "USP", "-----", normalized_rows
+
+        raw_source_rows = self._extract_s41_source_rows_from_pdf(content.source_pdf)
+        if not raw_source_rows:
+            raw_source_rows = self._extract_s41_source_rows_from_raw_text(content.raw_text)
+        if not raw_source_rows:
+            raw_source_rows = self._extract_s41_source_rows_from_flat_text(content.raw_text)
+        if raw_source_rows:
+            normalized_rows = [[test, acceptance, method] for test, method, acceptance in raw_source_rows]
+            return "USP", "-----", normalized_rows
+
+        return "USP", "-----", []
+
+    def _extract_s41_source_rows_from_raw_text(self, raw_text: str) -> list[list[str]]:
+        lines = []
+        for raw_line in raw_text.replace("", "°").splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            low = line.lower()
+            if (
+                low.startswith("drug mater file version:")
+                or low.startswith("product name ")
+                or low.startswith("module:")
+                or low.startswith("zhejiang starry pharmaceutical co., ltd")
+                or low.startswith("3.2.s.4 control of drug substance")
+                or low.startswith("3.2.s.4.1 specification")
+                or re.fullmatch(r"\d+\s+of\s+\d+", low)
+            ):
+                continue
+            lines.append(line)
+
+        start_idx = None
+        header_idx = None
+        for idx, line in enumerate(lines):
+            low = line.lower()
+            if "table 8 specification for final iodixanol" in low:
+                start_idx = idx
+            if start_idx is not None and "test method acceptance criteria" in low:
+                header_idx = idx
+                break
+        if header_idx is None:
+            return []
+
+        table_lines = lines[header_idx + 1 :]
+
+        def find_next(patterns: list[str], start: int) -> int:
+            for idx in range(start, len(table_lines)):
+                joined = table_lines[idx].lower()
+                if any(re.search(pattern, joined, flags=re.IGNORECASE) for pattern in patterns):
+                    return idx
+            return len(table_lines)
+
+        rows: list[list[str]] = []
+
+        def add_row(test: str, method: str, acceptance_parts: list[str]) -> None:
+            acceptance = " ".join(part.strip() for part in acceptance_parts if part.strip())
+            acceptance = re.sub(r"\s+", " ", acceptance).strip()
+            rows.append([test, method, acceptance])
+
+        simple_specs = [
+            ("Description", [r"^solubility\b"], "Visual"),
+            ("Solubility", [r"^transparency of\b"], "-"),
+            ("Transparency of solution", [r"^color of solution\b"], "Visual"),
+            ("Color of solution", [r"^specific rotation\b"], "Colorimetry"),
+            ("Specific Rotation (°)", [r"^identification\b"], "781S"),
+            ("Identification", [r"^pH\b"], "IR spectrum; HPLC; Positive reaction"),
+            ("pH", [r"^water\b"], "pH meter"),
+            ("Water", [r"^heavy metals\b"], "Method I (921)"),
+            ("Heavy metals", [r"^sulphated ash\b"], "Method I (231)"),
+            ("Sulphated ash", [r"^free iodine\b"], "Sulphated ash"),
+            ("Free iodine", [r"^free iodide\b"], "Color reaction"),
+            ("Free iodide", [r"^free aromatic amine\b"], "Titration"),
+            ("Free aromatic amine", [r"^limit of calcium\b"], "Spectrophotometry"),
+            ("Limit of calcium", [r"^ionic compounds\b"], "ICP"),
+            ("Ionic compounds", [r"^residual solvent\b"], "Conductivity"),
+        ]
+
+        cursor = 0
+        for test_name, next_patterns, method in simple_specs:
+            start = find_next([rf"^{re.escape(test_name.lower())}\b", rf"^{re.escape(test_name.split(' (')[0].lower())}\b"], cursor)
+            if start >= len(table_lines):
+                continue
+            next_idx = find_next(next_patterns, start + 1)
+            block = table_lines[start:next_idx]
+            if not block:
+                continue
+
+            if test_name == "Transparency of solution":
+                content = " ".join(block)
+                content = re.sub(r"^Transparency of\s*solution\s*", "", content, flags=re.IGNORECASE)
+            elif test_name == "Identification":
+                content = " ".join(block[1:]) if len(block) > 1 else ""
+                content = re.sub(r"\s+", " ", content).strip()
+                content = re.sub(r"\bA\.\s*IR spectrum\b", "A. IR spectrum:", content, flags=re.IGNORECASE)
+                content = re.sub(r"\bB\.\s*HPLC\b", " B. HPLC:", content, flags=re.IGNORECASE)
+                content = re.sub(r"\bC\.\s*Positive reaction\b", " C. Positive reaction:", content, flags=re.IGNORECASE)
+                add_row(test_name, method, [content])
+                cursor = next_idx
+                continue
+            else:
+                content = " ".join(block)
+                content = re.sub(rf"^{re.escape(test_name)}\s*", "", content, flags=re.IGNORECASE)
+
+            if method and content.lower().startswith(method.lower()):
+                content = content[len(method) :].strip(" :;-")
+            add_row(test_name, method, [content])
+            cursor = next_idx
+
+        residual_start = find_next([r"^residual solvent\b"], 0)
+        related1_start = find_next([r"^related compounds\(test 1\)\b"], residual_start + 1)
+        if residual_start < len(table_lines) and related1_start <= len(table_lines):
+            residual_lines = table_lines[residual_start + 1 : related1_start]
+            cleaned = [ln for ln in residual_lines if ln]
+            gc_method = "GC"
+            i = 0
+            while i < len(cleaned):
+                line = cleaned[i]
+                low = line.lower()
+                if low == "gc":
+                    i += 1
+                    continue
+                if low == "methanol":
+                    acceptance = cleaned[i + 2] if i + 2 < len(cleaned) and cleaned[i + 1].lower() == "gc" else ""
+                    add_row("Residual solvent - Methanol", gc_method, [acceptance])
+                    i += 3 if acceptance else 1
+                    continue
+                if low.startswith("isopropyl alcohol"):
+                    add_row("Residual solvent - Isopropyl alcohol", gc_method, [re.sub(r"^Isopropyl alcohol\s*", "", line, flags=re.IGNORECASE)])
+                elif low.startswith("1-methoxy-2-"):
+                    full = line
+                    if i + 1 < len(cleaned) and cleaned[i + 1].lower().startswith("propanol"):
+                        full = f"{line} {cleaned[i + 1]}"
+                        i += 1
+                    add_row(
+                        "Residual solvent - 1-methoxy-2-propanol",
+                        gc_method,
+                        [re.sub(r"^1-methoxy-2-\s*propanol\s*", "", full, flags=re.IGNORECASE)],
+                    )
+                elif low.startswith("methoxyethanol"):
+                    add_row("Residual solvent - Methoxyethanol", gc_method, [re.sub(r"^Methoxyethanol\s*", "", line, flags=re.IGNORECASE)])
+                elif low.startswith("1,3-dichloro-2-propanol"):
+                    rest = re.sub(r"^1,3-dichloro-2-propanol\s*", "", line, flags=re.IGNORECASE)
+                    if rest.upper().startswith("GC "):
+                        rest = rest[3:].strip()
+                    add_row("Residual solvent - 1,3-dichloro-2-propanol", gc_method, [rest])
+                i += 1
+
+        related2_start = find_next([r"^related compounds\(test 2\)\b"], related1_start + 1)
+        if related1_start < len(table_lines):
+            block = table_lines[related1_start + 1 : related2_start]
+            joined = "\n".join(block)
+            related_specs = [
+                ("Related compounds (Test 1) - Related compound B", r"Related compound B\s*HPLC\s*(NMT .*?)\s*(?=Related compound C|$)"),
+                ("Related compounds (Test 1) - Related compound C", r"Related compound C\s*(NMT .*?)\s*(?=Related compound D|$)"),
+                ("Related compounds (Test 1) - Related compound D", r"Related compound D\s*(NMT .*?)\s*(?=Related compound F|$)"),
+                ("Related compounds (Test 1) - Related compound F", r"Related compound F\s*(NMT .*?)\s*(?=Related compound G|$)"),
+                ("Related compounds (Test 1) - Related compound G", r"Related compound G\s*(NMT .*?)\s*(?=Iohexol|$)"),
+                ("Related compounds (Test 1) - Iohexol", r"Iohexol\s*(NMT .*?)\s*(?=O-alkylated compounds|$)"),
+                ("Related compounds (Test 1) - O-alkylated compounds", r"O-alkylated compounds\s*(NMT .*?)\s*(?=Others|$)"),
+                ("Related compounds (Test 1) - Others", r"Others\s*(Any individual unspecified .*?Total impurities: NMT 1\.5%\.)"),
+            ]
+            for test_name, pattern in related_specs:
+                found = re.search(pattern, joined, flags=re.IGNORECASE | re.DOTALL)
+                if found:
+                    add_row(test_name, "HPLC", [found.group(1)])
+
+        assay_start = find_next([r"^assay\b"], related2_start + 1)
+        if related2_start < len(table_lines):
+            block = table_lines[related2_start + 1 : assay_start]
+            joined = "\n".join(block)
+            found_e = re.search(r"Related compound E\s*HPLC\s*(NMT .*?)\s*(?=Related compound H|$)", joined, flags=re.IGNORECASE | re.DOTALL)
+            found_h = re.search(r"Related compound H\s*(NMT .*?)\s*(?=Microbial limits|$)", joined, flags=re.IGNORECASE | re.DOTALL)
+            if found_e:
+                add_row("Related compounds (Test 2) - Related compound E", "HPLC", [found_e.group(1)])
+            if found_h:
+                add_row("Related compounds (Test 2) - Related compound H", "HPLC", [found_h.group(1)])
+
+        microbial_limits_start = find_next([r"^microbial limits\b"], assay_start)
+        micro_purity_start = find_next([r"^microbiological purity\b"], microbial_limits_start + 1)
+        if microbial_limits_start < len(table_lines):
+            line = table_lines[microbial_limits_start]
+            found = re.search(r"Microbial limits\s+61\s+(.*)", line, flags=re.IGNORECASE)
+            if found:
+                add_row("Microbial limits", "61", [found.group(1)])
+
+        bacterial_endo_start = find_next([r"^bacterial endotoxin\b"], micro_purity_start + 1)
+        if micro_purity_start < len(table_lines):
+            block = table_lines[micro_purity_start:bacterial_endo_start]
+            joined = " ".join(block)
+            joined = re.sub(r"^Microbiological purity\s*-\s*", "", joined, flags=re.IGNORECASE)
+            add_row("Microbiological purity", "---------", [joined])
+
+        if assay_start < len(table_lines):
+            line = table_lines[assay_start]
+            found = re.search(r"Assay\s+Titration\s+(.*)", line, flags=re.IGNORECASE)
+            if found:
+                add_row("Assay", "Titration", [found.group(1)])
+
+        if bacterial_endo_start < len(table_lines):
+            block = " ".join(table_lines[bacterial_endo_start:])
+            found = re.search(r"Bacterial endotoxin\s*-\s*(.*)", block, flags=re.IGNORECASE)
+            if found:
+                add_row("Bacterial endotoxin", "---------", [found.group(1)])
+
+        return rows
+
+    def _extract_s41_source_rows_from_pdf_tables(self, pdf_path: Path) -> list[list[str]]:
+        try:
+            import fitz  # type: ignore
+        except Exception:
+            return []
+
+        rows: list[list[str]] = []
+        seen: set[tuple[str, str, str]] = set()
+        doc = None
+
+        try:
+            doc = fitz.open(str(pdf_path))
+            for page in doc:
+                page_text = " ".join(page.get_text("text", sort=True).split()).lower()
+                if "drug mater file" not in page_text and "table 8 specification for final iodixanol" not in page_text:
+                    continue
+
+                try:
+                    tables = page.find_tables().tables
+                except Exception:
+                    tables = []
+
+                for table in tables:
+                    raw_rows = table.extract()
+                    if not raw_rows:
+                        continue
+
+                    header_text = " ".join(
+                        self._clean_cell(str(cell or "")) for row in raw_rows[:3] for cell in row
+                    ).lower()
+                    if not any(token in header_text for token in ("acceptance criteria", "method", "test")):
+                        continue
+
+                    current_test = ""
+                    current_method = ""
+                    for raw_row in raw_rows:
+                        cells = [self._clean_cell(str(cell or "")) for cell in raw_row]
+                        non_empty = [cell for cell in cells if cell]
+                        if not non_empty:
+                            continue
+
+                        test = ""
+                        method = ""
+                        acceptance = ""
+
+                        if len(cells) >= 9:
+                            test = self._clean_cell(" ".join(cells[0:3]))
+                            method = self._clean_cell(" ".join(cells[3:6]))
+                            acceptance = self._clean_cell(" ".join(cells[6:9]))
+                        elif len(cells) >= 6:
+                            # Sometimes merged-cell tables still expand into more than 3 cells.
+                            span = max(1, len(cells) // 3)
+                            test = self._clean_cell(" ".join(cells[0:span]))
+                            method = self._clean_cell(" ".join(cells[span : 2 * span]))
+                            acceptance = self._clean_cell(" ".join(cells[2 * span :]))
+                        elif len(cells) >= 3:
+                            test = cells[0]
+                            method = cells[1]
+                            acceptance = cells[2]
+                        elif len(cells) == 2:
+                            # Preserve subrows where test cell is visually merged above.
+                            test = ""
+                            method = cells[0]
+                            acceptance = cells[1]
+                        else:
+                            continue
+
+                        header_key = " ".join((test, method, acceptance)).lower()
+                        if (
+                            not header_key
+                            or ("test" in test.lower() and "method" in method.lower() and "acceptance" in acceptance.lower())
+                            or ("test" == test.lower() and not method and not acceptance)
+                        ):
+                            continue
+
+                        if test:
+                            current_test = test
+                        elif current_test.lower() == "identification":
+                            # Keep blank test for split Identification subrows exactly as source structure.
+                            test = ""
+
+                        # Fill down vertically merged method cells such as HPLC / GC / Visual.
+                        # Source PDFs often show the method once for a block and leave following rows blank.
+                        if method:
+                            current_method = method
+                        elif acceptance and test:
+                            method = current_method
+
+                        row_key = (test.lower(), method.lower(), acceptance.lower())
+                        if row_key in seen:
+                            continue
+                        seen.add(row_key)
+                        rows.append([test, method, acceptance])
+        except Exception:
+            return []
+        finally:
+            if doc is not None:
+                doc.close()
+
+        return self._fill_down_s41_methods(rows)
+
+    def _fill_down_s41_methods(self, rows: list[list[str]]) -> list[list[str]]:
+        filled: list[list[str]] = []
+        carry_method = ""
+
+        for test, method, acceptance in rows:
+            test_clean = self._clean_cell(test)
+            method_clean = self._clean_cell(method)
+            acceptance_clean = self._clean_cell(acceptance)
+
+            if method_clean:
+                carry_method = method_clean
+            elif acceptance_clean and test_clean:
+                method_clean = carry_method
+
+            # Section/group label rows should not receive a carried method.
+            if test_clean.lower() in {
+                "identification",
+                "related compounds(test 1)",
+                "related compounds(test 2)",
+                "residual solvent",
+            } and not acceptance_clean:
+                method_clean = ""
+
+            filled.append([test_clean, method_clean, acceptance_clean])
+
+        return filled
+
+    def _extract_s41_source_rows_from_pdf(self, pdf_path: Path) -> list[list[str]]:
+        try:
+            import fitz  # type: ignore
+        except Exception:
+            return []
+
+        try:
+            collected_pages: list[str] = []
+            with fitz.open(pdf_path) as doc:
+                for page in doc:
+                    text = page.get_text("text", sort=True) or ""
+                    low = text.lower()
+                    if (
+                        "table 8 specification for final iodixanol" in low
+                        or "the specifications for iodixanol are provided in table 8" in low
+                        or "related compounds(test 1)" in low
+                    ):
+                        collected_pages.append(text)
+            if not collected_pages:
+                return []
+            return self._extract_s41_source_rows_from_raw_text("\n".join(collected_pages))
+        except Exception:
+            return []
+
+    def _extract_s41_source_rows_from_flat_text(self, raw_text: str) -> list[list[str]]:
+        text = raw_text.replace("", "°").replace("―", "-").replace("‖", "")
+        text = re.sub(r"\s+", " ", text).strip()
+        start_match = re.search(r"table\s*8\s*specification\s*for\s*final\s*iodixanol", text, flags=re.IGNORECASE)
+        if not start_match:
+            return []
+
+        segment = text[start_match.end() :]
+        end_match = re.search(r"bacterial\s*endotoxin\s*-?\s*NMT\s*0\.0038\s*IU?\s*for\s*1mg\s*of\s*iodixanol", segment, flags=re.IGNORECASE)
+        if end_match:
+            segment = segment[: end_match.end()]
+
+        anchors = [
+            ("Description", r"Description\s+Visual", "Visual"),
+            ("Solubility", r"Solubility\s+-", "---------"),
+            ("Transparency of solution", r"Transparency of\s+solution\s+Visual", "Visual"),
+            ("Color of solution", r"Color of\s+solution\s+Colorimetry", "Colorimetry"),
+            ("Specific Rotation (°)", r"Specific Rotation\s*\([^)]*\)\s+781S", "781S"),
+            ("Identification", r"Identification", "IR spectrum; HPLC; Positive reaction"),
+            ("pH", r"pH\s+pH meter", "pH meter"),
+            ("Water", r"Water\s+Method I \(921\)", "Method I (921)"),
+            ("Heavy metals", r"Heavy metals\s+Method I \(231\)", "Method I (231)"),
+            ("Sulphated ash", r"Sulphated ash\s+Sulphated ash", "Sulphated ash"),
+            ("Free iodine", r"Free iodine\s+Color reaction", "Color reaction"),
+            ("Free iodide", r"Free iodide\s+Titration", "Titration"),
+            ("Free aromatic amine", r"Free aromatic amine\s+Spectrophotometry", "Spectrophotometry"),
+            ("Limit of calcium", r"Limit of calcium\s+ICP", "ICP"),
+            ("Ionic compounds", r"Ionic compounds\s+Conductivity", "Conductivity"),
+            ("Residual solvent - Methanol", r"Residual solvent\s+Methanol\s+GC", "GC"),
+            ("Residual solvent - Isopropyl alcohol", r"Isopropyl alcohol", "GC"),
+            ("Residual solvent - 1-methoxy-2-propanol", r"1-methoxy-2-\s*propanol", "GC"),
+            ("Residual solvent - Methoxyethanol", r"Methoxyethanol", "GC"),
+            ("Residual solvent - 1,3-dichloro-2-propanol", r"1,3-dichloro-2-propanol\s+GC", "GC"),
+            ("Related compounds (Test 1) - Related compound B", r"Related compounds\(Test 1\)\s+Related compound B\s+HPLC", "HPLC"),
+            ("Related compounds (Test 1) - Related compound C", r"Related compound C", "HPLC"),
+            ("Related compounds (Test 1) - Related compound D", r"Related compound D", "HPLC"),
+            ("Related compounds (Test 1) - Related compound F", r"Related compound F", "HPLC"),
+            ("Related compounds (Test 1) - Related compound G", r"Related compound G", "HPLC"),
+            ("Related compounds (Test 1) - Iohexol", r"Iohexol", "HPLC"),
+            ("Related compounds (Test 1) - O-alkylated compounds", r"O-alkylated compounds", "HPLC"),
+            ("Related compounds (Test 1) - Others", r"Others", "HPLC"),
+            ("Related compounds (Test 2) - Related compound E", r"Related compounds\(Test 2\)\s+Related compound E\s+HPLC", "HPLC"),
+            ("Related compounds (Test 2) - Related compound H", r"Related compound H", "HPLC"),
+            ("Microbial limits", r"Microbial limits\s+61", "61"),
+            ("Microbiological purity", r"Microbiological purity\s+-", "---------"),
+            ("Assay", r"Assay\s+Titration", "Titration"),
+            ("Bacterial endotoxin", r"Bacterial endotoxin\s+-", "---------"),
+        ]
+
+        located: list[tuple[int, int, str, str]] = []
+        for test_name, pattern, method in anchors:
+            found = re.search(pattern, segment, flags=re.IGNORECASE)
+            if found:
+                located.append((found.start(), found.end(), test_name, method))
+
+        if len(located) < 5:
+            return []
+
+        located.sort(key=lambda item: item[0])
+        rows: list[list[str]] = []
+        for idx, (_, end, test_name, method) in enumerate(located):
+            next_start = located[idx + 1][0] if idx + 1 < len(located) else len(segment)
+            acceptance = segment[end:next_start].strip(" :-;")
+            acceptance = re.sub(r"\s+", " ", acceptance).strip()
+            if test_name == "Identification":
+                acceptance = re.sub(r"\bA\.\s*IR spectrum\b", "A. IR spectrum:", acceptance, flags=re.IGNORECASE)
+                acceptance = re.sub(r"\bB\.\s*HPLC\b", " B. HPLC:", acceptance, flags=re.IGNORECASE)
+                acceptance = re.sub(r"\bC\.\s*Positive reaction\b", " C. Positive reaction:", acceptance, flags=re.IGNORECASE)
+            if acceptance:
+                rows.append([test_name, method, acceptance])
+        return rows
+
+    @staticmethod
+    def _set_cell_text(cell, value: str) -> None:
+        cell.text = value
+
+    @staticmethod
+    def _trim_table_rows(table, keep_rows: int) -> None:
+        while len(table.rows) > keep_rows:
+            row = table.rows[-1]._tr
+            row.getparent().remove(row)
+
+    def _append_rows(self, table, rows: list[list[str]]) -> None:
+        for row_data in rows:
+            row = table.add_row()
+            for idx, value in enumerate(row_data[:3]):
+                self._set_cell_text(row.cells[idx], value)
+
+    def fill_s4_section(self, extracted: dict[str, ExtractedSectionContent], output_docx: Path) -> list[str]:
+        doc = Document(self.template_docx)
+        warnings: list[str] = []
+
+        start_idx, end_idx = self._get_target_range(doc)
+        s41_name_line = self._resolve_heading_line("2.3.S.4.1 Specification")
+        s42_name_line = self._resolve_heading_line("2.3.S.4.2 Analytical Procedures")
+        for heading in [
+            "2.3.S.4 Control of the API",
+        ]:
+            self._insert_heading_line_if_missing(doc, heading, s41_name_line, start_idx, end_idx)
+
+        for heading in [
+            "2.3.S.4.1 Specification",
+            "API specifications of the FPP manufacturer",
+        ]:
+            self._insert_heading_line_if_missing(doc, heading, s41_name_line, start_idx, end_idx)
+
+        self._insert_heading_line_if_missing(doc, "2.3.S.4.2 Analytical Procedures", s42_name_line, start_idx, end_idx)
+
+        start_idx, end_idx = self._get_target_range(doc)
+        self._remove_refer_lines(doc, start_idx, end_idx)
+
+        content = extracted["3.2.S.4.1"]
+        if content.warning:
+            warnings.append(f"3.2.S.4.1: {content.warning}")
+
+        table = self._find_s41_template_table(doc)
+        if table is None:
+            warnings.append("2.3.S.4.1: target specification table not found in template")
+        else:
+            standard, spec_ref, rows = self._extract_s41_metadata_and_rows(content)
+            self._set_cell_text(table.rows[0].cells[-1], standard or "USP")
+            self._set_cell_text(table.rows[1].cells[-1], spec_ref or "-----")
+            self._set_cell_text(table.rows[2].cells[0], "Test")
+            self._set_cell_text(table.rows[2].cells[1], "Acceptance criteria")
+            self._set_cell_text(table.rows[2].cells[2], "Analytical procedure\n(Type/Source/Version)")
+            self._trim_table_rows(table, keep_rows=3)
+            self._append_rows(table, rows)
+            if not rows:
+                warnings.append("2.3.S.4.1: no specification rows extracted from source PDF")
+
+        content_42 = extracted.get("3.2.S.4.2")
+        if content_42 and content_42.warning:
+            warnings.append(f"3.2.S.4.2: {content_42.warning}")
+        self._set_paragraph_text_with_suffix(
+            doc,
+            "Summary of the analytical procedures",
+            "Please refer to Module 3 Section 3.2.S.4.2",
+            start_idx,
+            end_idx,
+        )
+
+        output_docx.parent.mkdir(parents=True, exist_ok=True)
+        doc.save(output_docx)
+        return warnings
