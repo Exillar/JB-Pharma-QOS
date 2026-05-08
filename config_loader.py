@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -101,7 +102,7 @@ class NoiseConfig:
 
 
 # ---------------------------------------------------------------------------
-# S2 fill defaults (moved out of docx_builder to keep builder generic)
+# S2 fill defaults
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
@@ -156,7 +157,15 @@ class S2FillConfig:
         "certificate of good manufacturing practices",
     )
 
-    # 2.3.S.3.1 parsing controls and defaults
+
+# ---------------------------------------------------------------------------
+# S3 fill defaults (split out from S2FillConfig for clarity)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class S3Config:
+    """Parsing controls and defaults for QOS section 2.3.S.3.1 Characterisation."""
+
     s31_summary_start_keywords: tuple[str, ...] = (
         "the structural elucidation",
         "elucidation of structure",
@@ -189,6 +198,7 @@ class AppConfig:
     diagram: DiagramConfig = field(default_factory=DiagramConfig)
     noise: NoiseConfig = field(default_factory=NoiseConfig)
     s2_fill: S2FillConfig = field(default_factory=S2FillConfig)
+    s3_fill: S3Config = field(default_factory=S3Config)
 
     def with_overrides(
         self,
@@ -214,6 +224,7 @@ class AppConfig:
             diagram=self.diagram,
             noise=self.noise,
             s2_fill=self.s2_fill,
+            s3_fill=self.s3_fill,
         )
 
 
@@ -228,6 +239,7 @@ class PipelineConfig:
     diagram: DiagramConfig = field(default_factory=DiagramConfig)
     noise: NoiseConfig = field(default_factory=NoiseConfig)
     s2_fill: S2FillConfig = field(default_factory=S2FillConfig)
+    s3_fill: S3Config = field(default_factory=S3Config)
     verification_report_name: str = "verification_report.txt"
     generation_log_name: str = "generation.log"
 
@@ -235,11 +247,10 @@ class PipelineConfig:
     def module3_root(self) -> Path:
         # Some deployments point dossier_root at the dossier root (which contains "Module 3"),
         # while others point dossier_root directly at the "Module 3" folder itself.
-        direct = self.dossier_root
         nested = self.dossier_root / "Module 3"
         if nested.exists():
             return nested
-        return direct
+        return self.dossier_root
 
     @property
     def image_artifacts_dir(self) -> Path:
@@ -260,7 +271,6 @@ class PipelineConfig:
             self.output_docx.parent.mkdir(parents=True, exist_ok=True)
         except PermissionError:
             # Output folder may be locked down (e.g., OneDrive / corporate paths).
-            # The pipeline will fallback to a writable alternate output path.
             pass
 
 
@@ -279,10 +289,6 @@ class ConfigLoader:
         data = self._load_yaml(self.config_path)
         base_dir = self.config_path.parent
 
-        diagram = self._parse_diagram_config(data.get("diagram") or {})
-        noise = self._parse_noise_config(data.get("noise") or {})
-        s2_fill = self._parse_s2_fill_config(data.get("s2_fill") or {})
-
         return AppConfig(
             template_docx=self._resolve_path(data, "template_docx", base_dir),
             dossier_root=self._resolve_path(data, "dossier_root", base_dir),
@@ -291,151 +297,40 @@ class ConfigLoader:
             artifacts_dir=self._resolve_path(data, "artifacts_dir", base_dir),
             extractor_backend=str(data.get("extractor_backend", "pymupdf")),
             section=str(data.get("section", "s1")).lower(),
-            diagram=diagram,
-            noise=noise,
-            s2_fill=s2_fill,
+            diagram=self._parse_frozen_dataclass(DiagramConfig, data.get("diagram") or {}),
+            noise=self._parse_frozen_dataclass(NoiseConfig, data.get("noise") or {}),
+            s2_fill=self._parse_frozen_dataclass(S2FillConfig, data.get("s2_fill") or {}),
+            s3_fill=self._parse_frozen_dataclass(S3Config, data.get("s3_fill") or {}),
         )
 
     @staticmethod
-    def _parse_diagram_config(raw: dict[str, Any]) -> DiagramConfig:
-        defaults = DiagramConfig()
-        return DiagramConfig(
-            vector_diagram_sections=tuple(
-                raw.get("vector_diagram_sections", list(defaults.vector_diagram_sections))
-            ),
-            page_render_sections=tuple(
-                raw.get("page_render_sections", list(defaults.page_render_sections))
-            ),
-            min_diagram_drawings=int(
-                raw.get("min_diagram_drawings", defaults.min_diagram_drawings)
-            ),
-            chars_per_drawing_threshold=float(
-                raw.get("chars_per_drawing_threshold", defaults.chars_per_drawing_threshold)
-            ),
-            render_dpi_scale=float(
-                raw.get("render_dpi_scale", defaults.render_dpi_scale)
-            ),
-            header_crop_frac=float(
-                raw.get("header_crop_frac", defaults.header_crop_frac)
-            ),
-            footer_crop_frac=float(
-                raw.get("footer_crop_frac", defaults.footer_crop_frac)
-            ),
-            diagram_keywords=tuple(
-                raw.get("diagram_keywords", list(defaults.diagram_keywords))
-            ),
-            diagram_exclude_keywords=tuple(
-                raw.get("diagram_exclude_keywords", list(defaults.diagram_exclude_keywords))
-            ),
-        )
-
-    @staticmethod
-    def _parse_noise_config(raw: dict[str, Any]) -> NoiseConfig:
-        defaults = NoiseConfig()
-        return NoiseConfig(
-            company_name_prefixes=tuple(
-                raw.get("company_name_prefixes", list(defaults.company_name_prefixes))
-            ),
-            noise_page_threshold=int(
-                raw.get("noise_page_threshold", defaults.noise_page_threshold)
-            ),
-            noise_top_margin_frac=float(
-                raw.get("noise_top_margin_frac", defaults.noise_top_margin_frac)
-            ),
-            noise_bottom_margin_frac=float(
-                raw.get("noise_bottom_margin_frac", defaults.noise_bottom_margin_frac)
-            ),
-        )
-
-    @staticmethod
-    def _parse_s2_fill_config(raw: dict[str, Any]) -> S2FillConfig:
-        defaults = S2FillConfig()
-        return S2FillConfig(
-            alternate_processes_default=str(
-                raw.get("alternate_processes_default", defaults.alternate_processes_default)
-            ),
-            reprocessing_steps_default=str(
-                raw.get("reprocessing_steps_default", defaults.reprocessing_steps_default)
-            ),
-            manufacturer_table_responsibility_default=str(
-                raw.get(
-                    "manufacturer_table_responsibility_default",
-                    defaults.manufacturer_table_responsibility_default,
+    def _parse_frozen_dataclass(cls, raw: dict[str, Any]):
+        """Generic YAML→dataclass coercion for any frozen dataclass with scalar/tuple fields."""
+        defaults = cls()
+        kwargs: dict[str, Any] = {}
+        for f in dataclasses.fields(defaults):
+            yaml_val = raw.get(f.name)
+            default_val = getattr(defaults, f.name)
+            if yaml_val is None:
+                kwargs[f.name] = default_val
+                continue
+            if isinstance(default_val, tuple):
+                kwargs[f.name] = (
+                    tuple(yaml_val) if isinstance(yaml_val, (list, tuple)) else (str(yaml_val),)
                 )
-            ),
-            manufacturer_table_apprx_col=str(
-                raw.get("manufacturer_table_apprx_col", defaults.manufacturer_table_apprx_col)
-            ),
-            gmp_found_sentence=str(
-                raw.get("gmp_found_sentence", defaults.gmp_found_sentence)
-            ),
-            gmp_fallback_sentence=str(
-                raw.get("gmp_fallback_sentence", defaults.gmp_fallback_sentence)
-            ),
-            gmp_keywords=tuple(raw.get("gmp_keywords", list(defaults.gmp_keywords))),
-            restricted_phrase_keywords=tuple(
-                raw.get("restricted_phrase_keywords", list(defaults.restricted_phrase_keywords))
-            ),
-            s23_manufacturer_not_available_default=str(
-                raw.get(
-                    "s23_manufacturer_not_available_default",
-                    defaults.s23_manufacturer_not_available_default,
-                )
-            ),
-            s23_table_first_header_default=str(
-                raw.get(
-                    "s23_table_first_header_default",
-                    defaults.s23_table_first_header_default,
-                )
-            ),
-            narrative_start_keywords=tuple(
-                raw.get("narrative_start_keywords", list(defaults.narrative_start_keywords))
-            ),
-            narrative_end_keywords=tuple(
-                raw.get("narrative_end_keywords", list(defaults.narrative_end_keywords))
-            ),
-            s31_summary_start_keywords=tuple(
-                raw.get(
-                    "s31_summary_start_keywords",
-                    list(defaults.s31_summary_start_keywords),
-                )
-            ),
-            s31_summary_stop_keywords=tuple(
-                raw.get(
-                    "s31_summary_stop_keywords",
-                    list(defaults.s31_summary_stop_keywords),
-                )
-            ),
-            s31_max_summary_lines=int(
-                raw.get("s31_max_summary_lines", defaults.s31_max_summary_lines)
-            ),
-            s31_isomerism_default=str(
-                raw.get("s31_isomerism_default", defaults.s31_isomerism_default)
-            ),
-            s31_polymorph_reference_default=str(
-                raw.get(
-                    "s31_polymorph_reference_default",
-                    defaults.s31_polymorph_reference_default,
-                )
-            ),
-            s31_particle_size_default=str(
-                raw.get(
-                    "s31_particle_size_default",
-                    defaults.s31_particle_size_default,
-                )
-            ),
-            s31_other_characteristics_default=str(
-                raw.get(
-                    "s31_other_characteristics_default",
-                    defaults.s31_other_characteristics_default,
-                )
-            ),
-        )
+            elif isinstance(default_val, bool):
+                kwargs[f.name] = bool(yaml_val)
+            elif isinstance(default_val, int):
+                kwargs[f.name] = int(yaml_val)
+            elif isinstance(default_val, float):
+                kwargs[f.name] = float(yaml_val)
+            else:
+                kwargs[f.name] = str(yaml_val)
+        return cls(**kwargs)
 
     @staticmethod
     def _load_yaml(path: Path) -> dict[str, Any]:
-        raw = path.read_text(encoding="utf-8")
-        data = yaml.safe_load(raw) or {}
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
         if not isinstance(data, dict):
             raise ValueError("Config YAML must be a mapping at the root")
         return data
@@ -443,9 +338,7 @@ class ConfigLoader:
     @staticmethod
     def _clean_path_str(val: object) -> str:
         s = str(val).strip()
-        # YAML already parses quoted scalars, but users sometimes include literal quotes
-        # inside the value, e.g. '"D:\\path\\file.docx"'. Strip one wrapping layer.
-        if (len(s) >= 2) and ((s[0] == s[-1]) and s[0] in ("'", '"')):
+        if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
             s = s[1:-1].strip()
         return s
 
