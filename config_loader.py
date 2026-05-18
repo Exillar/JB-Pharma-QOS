@@ -141,6 +141,7 @@ class S2FillConfig:
         "confidential",
     )
 
+
     # 2.3.S.2.3 inline fallback next to point (b) manufacturer-address label.
     s23_manufacturer_not_available_default: str = "NA"
 

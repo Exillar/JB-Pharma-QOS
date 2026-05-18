@@ -450,6 +450,9 @@ class _DocxHelper:
     def _resolve_name_manufacturer_line(
         self, ref_docx: Path | None, section_heading: str
     ) -> str:
+        override = getattr(self, "_name_mfr_line", "")
+        if override:
+            return override
         if not ref_docx or not ref_docx.exists():
             return ""
         try:

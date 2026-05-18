@@ -23,9 +23,12 @@ class S4DocxFiller(_DocxHelper):
         self,
         template_docx: Path,
         filled_reference_docx: Path | None = None,
+        *,
+        preserve_repeated_patterns: tuple[str, ...] = (),
     ) -> None:
         self.template_docx = template_docx
         self.filled_reference_docx = filled_reference_docx
+        self._preserve_repeated_patterns = preserve_repeated_patterns
 
     @staticmethod
     def _clean_cell(text: str) -> str:
@@ -248,18 +251,24 @@ class S4DocxFiller(_DocxHelper):
         )
         page_pat = re.compile(r"^\s*(\d+\s+of\s+\d+|\d+)\s*$", re.IGNORECASE)
         header_pat = re.compile(
-            r"^\s*(module\s*:|version\s*:|date\s*:|open\s+part|confidential)\b",
+            r"^\s*(module\s*:|version\s*:|date\s*:|open\s+part|confidential|product\s+name|drug\s+master\s+file|drug\s+mater\s+file)\b",
             re.IGNORECASE,
         )
         footer_pat = re.compile(r"^.{5,75}\s+\d{1,4}$")
 
         table_rows = table_row_texts or set()
         out_lines: list[str] = []
+        seen_section = False
         for raw_line in (content.raw_text or "").splitlines():
             line = re.sub(r"\s+", " ", raw_line).strip()
             if not line:
                 continue
-            if section_pat.match(line) or refer_pat.match(line) or page_pat.match(line):
+            if section_pat.match(line) or refer_pat.match(line):
+                if seen_section:
+                    break
+                seen_section = True
+                continue
+            if page_pat.match(line):
                 continue
             if header_pat.match(line):
                 continue
@@ -289,6 +298,33 @@ class S4DocxFiller(_DocxHelper):
             seen.add(norm)
 
         return "\n".join(deduped).strip()
+
+    def _filter_tables_for_section(
+        self,
+        tables: list[list[list[str]]],
+        *,
+        refer_section: str,
+    ) -> list[list[list[str]]]:
+        if not tables:
+            return []
+        filtered: list[list[list[str]]] = []
+        seen: set[str] = set()
+        for t in tables:
+            flat = " ".join(self._clean_cell(cell) for row in t for cell in row).strip()
+            if not flat:
+                continue
+            flat_lower = flat.lower()
+            if refer_section == "3.2.S.4.5":
+                if "drug master file" in flat_lower or "drug mater file" in flat_lower:
+                    continue
+                if "module" in flat_lower and "open part" in flat_lower:
+                    continue
+            key = re.sub(r"\s+", " ", flat_lower)
+            if key in seen:
+                continue
+            seen.add(key)
+            filtered.append(t)
+        return filtered
 
     # ------------------------------------------------------------------
     # S4.5 content insertion helper
@@ -362,6 +398,7 @@ class S4DocxFiller(_DocxHelper):
 
         cursor = doc.paragraphs[idx]
         tables = [t for t in content.tables if self._table_has_content(t)]
+        tables = self._filter_tables_for_section(tables, refer_section=refer_section)
         table_row_texts: set[str] = set()
         for table_rows in tables:
             for row in table_rows:
@@ -556,8 +593,14 @@ class S4DocxFiller(_DocxHelper):
             if warn:
                 warnings.append(warn)
 
+        preserve_patterns = tuple(self._preserve_repeated_patterns)
+        for name_line in (s41_name, s42_name, s45_name):
+            if name_line:
+                preserve_patterns = preserve_patterns + (name_line,)
         cleanup_stats = run_artifact_cleanup(
-            doc, keep_first_n_tables=template_table_count
+            doc,
+            keep_first_n_tables=template_table_count,
+            preserve_repeated_patterns=preserve_patterns,
         )
         if any(cleanup_stats.values()):
             warnings.append(f"cleanup: {cleanup_stats}")

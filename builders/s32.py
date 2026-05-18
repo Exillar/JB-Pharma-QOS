@@ -25,11 +25,13 @@ class S32DocxFiller(_DocxHelper):
         *,
         images_dir: Path | None = None,
         diagram_cfg: DiagramConfig | None = None,
+        preserve_repeated_patterns: tuple[str, ...] = (),
     ) -> None:
         self.template_docx = template_docx
         self.filled_reference_docx = filled_reference_docx
         self.images_dir = images_dir
         self.diagram_cfg = diagram_cfg or DiagramConfig()
+        self._preserve_repeated_patterns = preserve_repeated_patterns
 
     def _find_section_pages(
         self,
@@ -62,13 +64,14 @@ class S32DocxFiller(_DocxHelper):
             return ""
         return re.sub(r"\s+", " ", str(s).replace(" ", " ").strip())
 
-    def _extract_api_impurity_rows(
+
+    def _extract_api_impurity_table_images(
         self,
         pdf_path: Path,
         *,
         refer_section: str = "3.2.S.3.2",
         next_section: str = "3.2.S.3.3",
-    ) -> tuple[list[dict[str, object]], list[str]]:
+    ) -> tuple[list[Path], list[str]]:
         warnings: list[str] = []
         if self.images_dir is None:
             return ([], ["images_dir not configured"])
@@ -82,7 +85,7 @@ class S32DocxFiller(_DocxHelper):
             ).lower()
             return ("api-related impurity" in flat) and ("structure" in flat) and ("origin" in flat)
 
-        entry_specs: list[dict[str, object]] = []
+        images: list[Path] = []
         try:
             with fitz.open(pdf_path) as doc:
                 sp, ep = self._find_section_pages(doc, refer_section, next_section=next_section)
@@ -102,138 +105,31 @@ class S32DocxFiller(_DocxHelper):
                         if not extracted or not is_api_table(extracted):
                             continue
 
-                        row_stream: list[dict[str, object]] = []
-                        for ridx, row_text in enumerate(extracted):
-                            if ridx >= len(tab.rows):
-                                break
-                            c0 = self._norm_cell(row_text[0] if len(row_text) > 0 else "")
-                            c2 = self._norm_cell(row_text[2] if len(row_text) > 2 else "")
-                            low_all = f"{c0} {c2}".lower().strip()
-                            if not low_all:
-                                continue
-                            if "api-related impurity" in low_all or low_all in {"structure", "origin", "structure origin"}:
-                                continue
-                            if "descriptor" in c0.lower() or "compendial" in c0.lower():
-                                continue
-                            bbox1 = None
-                            try:
-                                bbox1 = tab.rows[ridx].cells[1]
-                            except Exception:
-                                pass
-                            row_stream.append({"name": c0, "origin": c2, "bbox": bbox1, "page_index": pidx})
-
-                        current: dict[str, object] | None = None
-                        for item in row_stream:
-                            name = str(item["name"] or "").strip()
-                            origin = str(item["origin"] or "").strip()
-                            bbox = item["bbox"]
-                            pindex = int(item["page_index"])
-                            starts_new = bool(name) and (not name.startswith("(")) and bool(origin)
-                            if current is None and not starts_new:
-                                continue
-                            if starts_new:
-                                if current is not None:
-                                    entry_specs.append(current)
-                                current = {
-                                    "name_parts": [name] if name else [],
-                                    "origin_parts": [origin] if origin else [],
-                                    "page_index": pindex,
-                                    "bbox_union": None,
-                                }
-                            else:
-                                if name:
-                                    current["name_parts"].append(name)
-                                if origin:
-                                    current["origin_parts"].append(origin)
-                            if current is not None and bbox is not None:
-                                try:
-                                    rect = fitz.Rect(*bbox) & page.rect
-                                except Exception:
-                                    rect = None
-                                if rect is not None and not rect.is_empty:
-                                    prev = current.get("bbox_union")
-                                    current["bbox_union"] = rect if prev is None else (prev | rect)
-                        if current is not None:
-                            entry_specs.append(current)
+                        try:
+                            rect = fitz.Rect(tab.bbox) & page.rect
+                        except Exception:
+                            rect = None
+                        if rect is None or rect.is_empty:
+                            continue
+                        pad_x = max(6.0, rect.width * 0.02)
+                        pad_y = max(6.0, rect.height * 0.02)
+                        clip = fitz.Rect(
+                            rect.x0 - pad_x, rect.y0 - pad_y,
+                            rect.x1 + pad_x, rect.y1 + pad_y,
+                        ) & page.rect
+                        out = self.images_dir / f"3_2_S_3_2_api_table_p{pidx + 1}_{len(images) + 1}.png"
+                        try:
+                            pix = page.get_pixmap(
+                                matrix=fitz.Matrix(scale, scale), clip=clip, alpha=False
+                            )
+                            pix.save(str(out))
+                            images.append(out)
+                        except Exception as img_err:
+                            warnings.append(f"failed to render table image: {img_err}")
         except Exception as e:
-            return ([], [f"failed to read PDF {pdf_path.name}: {e}"])
+            warnings.append(f"failed to read PDF {pdf_path.name}: {e}")
 
-        out_rows: list[dict[str, object]] = []
-        try:
-            with fitz.open(pdf_path) as doc:
-                for i, e in enumerate(entry_specs, start=1):
-                    name = " ".join(p for p in e.get("name_parts", []) if p).strip()
-                    origin = " ".join(p for p in e.get("origin_parts", []) if p).strip()
-                    page_index = int(e.get("page_index", 0))
-                    rect = e.get("bbox_union")
-                    image_path: Path | None = None
-
-                    if rect is not None:
-                        page = doc.load_page(page_index)
-                        cell_rect = fitz.Rect(rect) & page.rect
-                        if not cell_rect.is_empty:
-                            inset_x = max(4.0, cell_rect.width * 0.02)
-                            inset_y = max(4.0, cell_rect.height * 0.02)
-                            inner = fitz.Rect(
-                                cell_rect.x0 + inset_x, cell_rect.y0 + inset_y,
-                                cell_rect.x1 - inset_x, cell_rect.y1 - inset_y,
-                            ) & cell_rect
-
-                            def accept(r: fitz.Rect) -> bool:
-                                if r.is_empty:
-                                    return False
-                                if r.width >= cell_rect.width * 0.92 or r.height >= cell_rect.height * 0.92:
-                                    return False
-                                if inner.is_empty:
-                                    return True
-                                return not (r & inner).is_empty
-
-                            union = None
-                            try:
-                                for d in page.get_drawings():
-                                    drect = d.get("rect")
-                                    if drect is None:
-                                        continue
-                                    r = fitz.Rect(drect) & cell_rect
-                                    if accept(r):
-                                        union = r if union is None else (union | r)
-                            except Exception:
-                                pass
-                            try:
-                                for img in page.get_images(full=True):
-                                    xref = img[0]
-                                    for r0 in page.get_image_rects(xref):
-                                        r = fitz.Rect(r0) & cell_rect
-                                        if accept(r):
-                                            union = r if union is None else (union | r)
-                            except Exception:
-                                pass
-
-                            clip0 = union or cell_rect
-                            pad_x = max(2.0, clip0.width * 0.03)
-                            pad_y = max(2.0, clip0.height * 0.03)
-                            clip = fitz.Rect(
-                                clip0.x0 - pad_x, clip0.y0 - pad_y,
-                                clip0.x1 + pad_x, clip0.y1 + pad_y,
-                            ) & page.rect
-                            out = self.images_dir / f"3_2_S_3_2_api_structure_{i}.png"
-                            try:
-                                pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), clip=clip, alpha=False)
-                                pix.save(str(out))
-                                image_path = out
-                            except Exception as img_err:
-                                warnings.append(f"failed to render structure image for row {i}: {img_err}")
-
-                    if name or origin or image_path:
-                        out_rows.append({"name": name, "origin": origin, "structure_image": image_path})
-        except Exception as e:
-            warnings.append(f"failed to render images: {e}")
-
-        return (out_rows, warnings)
-
-    def _estimate_table_col_width_emu(self, doc: _Document, *, ncols: int) -> int:
-        available = self._get_available_page_width(doc)
-        return max(int(available / max(1, ncols)), int(914400 * 1.2))
+        return (images, warnings)
 
     def fill_s32_section(
         self,
@@ -258,9 +154,9 @@ class S32DocxFiller(_DocxHelper):
         payload = extracted.get("3.2.S.3.2")
         if not payload:
             warnings.append("3.2.S.3.2: missing extracted payload")
-            rows: list[dict[str, object]] = []
+            table_images: list[Path] = []
         else:
-            rows, ws = self._extract_api_impurity_rows(payload.source_pdf)
+            table_images, ws = self._extract_api_impurity_table_images(payload.source_pdf)
             warnings.extend(f"3.2.S.3.2: {w}" for w in ws)
 
         start_idx, end_idx = self._get_target_range(doc)
@@ -300,51 +196,44 @@ class S32DocxFiller(_DocxHelper):
             if placeholder is None:
                 warnings.append("3.2.S.3.2: API impurity placeholder table not found in template")
             else:
-                needed = 1 + len(rows)
-                while len(placeholder.rows) < needed:
-                    placeholder.add_row()
-
-                col_width = self._estimate_table_col_width_emu(doc, ncols=len(placeholder.columns))
-                try:
-                    from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT
-                except Exception:
-                    WD_CELL_VERTICAL_ALIGNMENT = None
-
-                for i, row in enumerate(rows, start=1):
-                    name = str(row.get("name") or "")
-                    origin = str(row.get("origin") or "")
-                    img = row.get("structure_image")
-
-                    self._safe_set_cell_text(placeholder.cell(i, 0), name)
-                    self._safe_set_cell_text(placeholder.cell(i, 2), origin)
-                    self._safe_set_cell_text(placeholder.cell(i, 1), "")
-
+                if table_images:
+                    anchor_p = doc.paragraphs[anchor_idx]
+                    p = self._insert_paragraph_after(anchor_p, "")
+                    current_p = p
                     try:
-                        if WD_CELL_VERTICAL_ALIGNMENT is not None:
-                            placeholder.cell(i, 1).vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
-                    except Exception:
-                        pass
-
-                    if img and isinstance(img, Path) and img.exists():
-                        p = placeholder.cell(i, 1).paragraphs[0]
                         try:
-                            p.alignment = 1
-                            p.paragraph_format.space_before = 0
-                            p.paragraph_format.space_after = 0
+                            from docx.enum.text import WD_BREAK
                         except Exception:
-                            pass
-                        run = p.add_run()
-                        try:
-                            max_w = min(int(col_width * 0.90), int(914400 * 1.85))
-                            max_h = int(914400 * 1.05)
-                            self._add_picture_autofit_bounds(run, img, max_width_emu=max_w, max_height_emu=max_h)
-                        except Exception as e:
-                            warnings.append(f"3.2.S.3.2: failed to insert structure image for row {i}: {e}")
+                            WD_BREAK = None
 
-                if not rows:
-                    warnings.append("3.2.S.3.2: no API impurity rows extracted from PDF")
+                        for idx, table_img in enumerate(table_images, start=1):
+                            if not isinstance(table_img, Path) or not table_img.exists():
+                                warnings.append(f"3.2.S.3.2: table image missing: {table_img}")
+                                continue
+                            if idx > 1 and WD_BREAK is not None:
+                                run = current_p.add_run()
+                                run.add_break(WD_BREAK.PAGE)
+                                current_p = self._insert_paragraph_after(current_p, "")
+                            run = current_p.add_run()
+                            self._add_picture_autofit(run, table_img, doc)
+                            if idx < len(table_images):
+                                current_p = self._insert_paragraph_after(current_p, "")
+                        parent = placeholder._element.getparent()
+                        if parent is not None:
+                            parent.remove(placeholder._element)
+                    except Exception as e:
+                        warnings.append(f"3.2.S.3.2: failed to insert table image: {e}")
+                else:
+                    warnings.append("3.2.S.3.2: table image not extracted from PDF")
 
-        cleanup_stats = run_artifact_cleanup(doc, keep_first_n_tables=template_table_count)
+        preserve_patterns = tuple(self._preserve_repeated_patterns)
+        if name_line:
+            preserve_patterns = preserve_patterns + (name_line,)
+        cleanup_stats = run_artifact_cleanup(
+            doc,
+            keep_first_n_tables=template_table_count,
+            preserve_repeated_patterns=preserve_patterns,
+        )
         if any(cleanup_stats.values()):
             warnings.append(f"cleanup: {cleanup_stats}")
 

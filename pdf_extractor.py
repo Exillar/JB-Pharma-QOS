@@ -95,10 +95,12 @@ class PdfSectionExtractor:
         images_dir: Path,
         diagram_cfg: DiagramConfig | None = None,
         noise_cfg: NoiseConfig | None = None,
+        preserve_keywords: tuple[str, ...] = (),
     ) -> None:
         self.images_dir = images_dir
         self._dcfg = diagram_cfg or DiagramConfig()
         self._ncfg = noise_cfg or NoiseConfig()
+        self._preserve_keywords = tuple(k.lower() for k in preserve_keywords if k)
 
     # ------------------------------------------------------------------
     # Section-ID helpers
@@ -309,7 +311,9 @@ class PdfSectionExtractor:
         # ---- Embedded image XREFs (default path) --------------------------
         page = doc.load_page(page_index)
         image_list = page.get_images(full=True)
-        ranked: list[tuple[int, Path]] = []
+        best_pix = None
+        best_area = 0
+        best_path: Path | None = None
 
         for img_idx, img in enumerate(image_list, start=1):
             xref = img[0]
@@ -318,15 +322,18 @@ class PdfSectionExtractor:
                 pix = fitz.Pixmap(doc, xref)
                 if pix.alpha:
                     pix = fitz.Pixmap(fitz.csRGB, pix)
-                ranked.append((pix.width * pix.height, out))
-                pix.save(out)
+                area = pix.width * pix.height
+                if area > best_area:
+                    best_area = area
+                    best_pix = pix
+                    best_path = out
             except Exception:
                 continue
 
-        if ranked:
-            # Return only the largest image (structural formula / main graphic).
-            best = max(ranked, key=lambda t: t[0])
-            return [best[1]]
+        if best_pix is not None and best_path is not None:
+            # Save only the largest image (structural formula / main graphic).
+            best_pix.save(str(best_path))
+            return [best_path]
 
         # ---- Page-render fallback (e.g. 3.2.S.1.2 structural formula) ----
         if refer_section in self._dcfg.page_render_sections:
@@ -397,6 +404,9 @@ class PdfSectionExtractor:
 
             # Aggressively repeated lines (>= 3× and non-trivial length).
             if freq[key] >= 3 and len(key) > 12:
+                if self._preserve_keywords and any(k in key_lower for k in self._preserve_keywords):
+                    cleaned.append(ln)
+                    continue
                 continue
 
             cleaned.append(ln)

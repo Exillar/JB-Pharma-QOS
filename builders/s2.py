@@ -698,10 +698,13 @@ class S2DocxFiller(_DocxHelper):
         if idx is not None and s26_data.get("a"):
             self._insert_paragraph_after(doc.paragraphs[idx], s26_data["a"])
 
+        preserve_patterns = tuple(self.cfg.restricted_phrase_keywords)
+        if name_line:
+            preserve_patterns = preserve_patterns + (name_line,)
         cleanup_stats = run_artifact_cleanup(
             doc,
             keep_first_n_tables=template_table_count,
-            preserve_repeated_patterns=self.cfg.restricted_phrase_keywords,
+            preserve_repeated_patterns=preserve_patterns,
         )
         if any(cleanup_stats.values()):
             warnings.append(f"cleanup: {cleanup_stats}")
