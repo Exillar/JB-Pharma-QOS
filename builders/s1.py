@@ -67,26 +67,72 @@ class S1DocxFiller(_DocxHelper):
         }
 
     def _parse_s13(self, raw_text: str) -> dict[str, str]:
-        melt = self._extract_block(raw_text, r"\bMelting\s+point\b", [r"\bpH\s*[-:]\b"]) or ""
-        ph = self._extract_block(raw_text, r"\bpH\s*[-:]", [r"\bPartition\s+coefficients\b"]) or ""
-        part = self._extract_block(raw_text, r"\bPartition\s+coefficients\b\s*[-:]", [r"\bPK\s*[-:]"]) or ""
-        pk = self._extract_block(raw_text, r"\bPK\s*[-:]", [r"\bSpecific\s+Rotation\b"]) or ""
-        rot = self._extract_block(raw_text, r"\bSpecific\s+Rotation\b", [r"\bPolymorphic\s+Form\b", r"\bSolub"]) or ""
-        desc = self._extract_block(raw_text, r"\bPhysical\s+description\b\s*[-:]?", [r"\bSolub", r"\bPolymorphic"]) or ""
-        sol = self._extract_block(raw_text, r"\bSolub(?:ility|ilities)\b\s*[-:]?", [r"\bPolymorphic", r"\bpH\b"]) or ""
-        poly = self._extract_block(raw_text, r"\bPolymorphic\s+[Ff]orm\b\s*[-:]?", [r"\bSolvate", r"\bHydrate"]) or ""
+        def _block_any(starts: list[str], ends: list[str]) -> str:
+            for s in starts:
+                block = self._extract_block(raw_text, s, ends)
+                if block:
+                    return block
+            return ""
+
+        melt = _block_any(
+            [r"\bMelting\s+point\b"],
+            [r"\bpH\s*[-:]\b", r"\bPartition\s+coefficients\b"],
+        )
+        ph = _block_any(
+            [r"\bpH\s*[-:]"],
+            [r"\bPartition\s+coefficients\b", r"\bPK\s*[-:]"]
+        )
+        part = _block_any(
+            [r"\bPartition\s+coefficients\b\s*[-:]"],
+            [r"\bPK\s*[-:]", r"\bSpecific\s+Rotation\b"],
+        )
+        pk = _block_any(
+            [r"\bPK\s*[-:]"],
+            [r"\bSpecific\s+Rotation\b", r"\bPolymorphic\s+Form\b"],
+        )
+        rot = _block_any(
+            [r"\bSpecific\s+Rotation\b"],
+            [r"\bPolymorphic\s+Form\b", r"\bSolub"],
+        )
+        desc = _block_any(
+            [
+                r"\bPhysical\s+description\b\s*[-:]?",
+                r"\bDescription\b\s*[-:]?",
+            ],
+            [r"\bSolub", r"\bPolymorphic", r"\bMelting\s+point\b"],
+        )
+        sol = _block_any(
+            [r"\bSolub(?:ility|ilities)\b\s*[-:]?"],
+            [r"\bPolymorphic", r"\bpH\b", r"\bMelting\s+point\b"],
+        )
+        poly = _block_any(
+            [r"\bPolymorphic\s+[Ff]orm\b\s*[-:]?", r"\bPolymeric\s+[Ff]orm\b\s*[-:]?"],
+            [r"\bSolvate", r"\bHydrate", r"\bOther\b"],
+        )
+        solvate = _block_any(
+            [r"\bSolvate\b\s*[-:]?"],
+            [r"\bHydrate\b", r"\bOther\b"],
+        )
+        hydrate = _block_any(
+            [r"\bHydrate\b\s*[-:]?"],
+            [r"\bOther\b"],
+        )
+        other = _block_any(
+            [r"\bOther\b\s*[:]?"],
+            [r"\b3\.2\.S\.", r"\b2\.3\.S\."]
+        )
         return {
-            "a": self._first_meaningful_line(desc),
+            "a": self._first_meaningful_line(desc) or desc.strip(),
             "b": self._first_meaningful_line(sol) or sol.strip(),
-            "poly": self._first_meaningful_line(poly),
-            "solvate": "",
-            "hydrate": "",
-            "other": "",
-            "ph": self._first_meaningful_line(ph),
+            "poly": self._first_meaningful_line(poly) or poly.strip(),
+            "solvate": self._first_meaningful_line(solvate) or solvate.strip(),
+            "hydrate": self._first_meaningful_line(hydrate) or hydrate.strip(),
+            "other": other.strip(),
+            "ph": self._first_meaningful_line(ph) or ph.strip(),
             "pk": "\n".join(ln.strip() for ln in pk.splitlines() if ln.strip()),
             "partition": "\n".join(ln.strip() for ln in part.splitlines() if ln.strip()),
-            "melting": self._first_meaningful_line(melt),
-            "rotation": self._first_meaningful_line(rot),
+            "melting": self._first_meaningful_line(melt) or melt.strip(),
+            "rotation": self._first_meaningful_line(rot) or rot.strip(),
             "refractive": "",
             "hygro": "",
             "uv": "",
@@ -247,7 +293,12 @@ class S1DocxFiller(_DocxHelper):
 
         self._fill_property_table(doc, s13)
         self._apply_visual_formatting(doc, start_idx, end_idx)
-        cleanup_stats = run_artifact_cleanup(doc, keep_first_n_tables=template_table_count)
+        preserve_patterns = tuple(p for p in (name_mfr_line,) if p)
+        cleanup_stats = run_artifact_cleanup(
+            doc,
+            keep_first_n_tables=template_table_count,
+            preserve_repeated_patterns=preserve_patterns,
+        )
         if any(cleanup_stats.values()):
             warnings.append(f"cleanup: {cleanup_stats}")
 

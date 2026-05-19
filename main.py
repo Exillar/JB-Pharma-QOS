@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,7 +13,9 @@ from builders import (
     S3DocxFiller,
     S32DocxFiller,
     S4DocxFiller,
+    S5DocxFiller,
     GenericSectionFiller,
+    P1DocxFiller,
 )
 from config_loader import AppConfig, ConfigLoader, PipelineConfig
 from pdf_extractor import ExtractedSectionContent, PdfSectionExtractor
@@ -84,6 +87,7 @@ class QosPipeline:
                 cfg.filled_reference_docx,
                 images_dir=cfg.image_artifacts_dir,
                 diagram_cfg=cfg.diagram,
+                preserve_repeated_patterns=cfg.s2_fill.restricted_phrase_keywords,
             ),
             fill_runner=lambda f, p, o: f.fill_s32_section(p, o),
             start_label="2.3.S.3.2 Impurities",
@@ -95,6 +99,7 @@ class QosPipeline:
             filler_factory=lambda cfg: S4DocxFiller(
                 cfg.template_docx,
                 cfg.filled_reference_docx,
+                preserve_repeated_patterns=cfg.s2_fill.restricted_phrase_keywords,
             ),
             fill_runner=lambda f, p, o: f.fill_s4_section(p, o),
             start_label="2.3.S.4 Control of the API",
@@ -103,13 +108,14 @@ class QosPipeline:
         ),
         "s5": SectionSpec(
             refer_sections=["3.2.S.5"],
-            filler_factory=lambda cfg: GenericSectionFiller(
+            filler_factory=lambda cfg: S5DocxFiller(
                 cfg.template_docx,
-                "2.3.S.5 Reference Standards or Materials",
-                "2.3.S.6 Container Closure System",
                 cfg.filled_reference_docx,
+                images_dir=cfg.image_artifacts_dir,
+                diagram_cfg=cfg.diagram,
+                preserve_repeated_patterns=cfg.s2_fill.restricted_phrase_keywords,
             ),
-            fill_runner=lambda f, p, o: f.fill_section(p, o),
+            fill_runner=lambda f, p, o: f.fill_s5_section(p, o),
             start_label="2.3.S.5 Reference Standards or Materials",
             end_label="2.3.S.6 Container Closure System",
             log_title="QOS 2.3.S.5 generation warnings",
@@ -121,6 +127,7 @@ class QosPipeline:
                 "2.3.S.6 Container Closure System",
                 "2.3.S.7 Stability",
                 cfg.filled_reference_docx,
+                preserve_repeated_patterns=cfg.s2_fill.restricted_phrase_keywords,
             ),
             fill_runner=lambda f, p, o: f.fill_section(p, o),
             start_label="2.3.S.6 Container Closure System",
@@ -134,22 +141,105 @@ class QosPipeline:
                 "2.3.S.7 Stability",
                 "2.3.P",
                 cfg.filled_reference_docx,
+                preserve_repeated_patterns=cfg.s2_fill.restricted_phrase_keywords,
             ),
             fill_runner=lambda f, p, o: f.fill_section(p, o),
             start_label="2.3.S.7 Stability",
             end_label="2.3.P",
             log_title="QOS 2.3.S.7 generation warnings",
         ),
+        "p1": SectionSpec(
+            refer_sections=["3.2.P.1"],
+            filler_factory=lambda cfg: P1DocxFiller(
+                cfg.template_docx,
+                cfg.filled_reference_docx,
+                preserve_repeated_patterns=cfg.s2_fill.restricted_phrase_keywords,
+            ),
+            fill_runner=lambda f, p, o: f.fill_p1_section(p, o),
+            start_label="2.3.P.1 Description and Composition of the FPP",
+            end_label="2.3.P.2 Pharmaceutical Development",
+            log_title="QOS 2.3.P.1 generation warnings",
+        ),
     }
 
     # Ordered pipeline for --section=all.
     # Each entry is (section_key, output_stem).
     # The output of step N becomes the template input for step N+1.
-    ALL_SECTIONS: list[str] = ["s1", "s2", "s3", "s32", "s4", "s5", "s6", "s7"]
+    ALL_SECTIONS: list[str] = ["s1", "s2", "s3", "s32", "s4", "s5", "s6", "s7", "p1"]
 
     def __init__(self, config: PipelineConfig, section: str) -> None:
         self.config = config
         self.section = section.lower().strip()
+
+    @staticmethod
+    def _extract_product_name(text: str) -> str:
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        for i, ln in enumerate(lines):
+            low = ln.lower()
+            if "compendial name" in low:
+                if ":" in ln:
+                    tail = ln.split(":", 1)[1].strip()
+                    if tail:
+                        return tail
+                if i + 1 < len(lines):
+                    return lines[i + 1].strip()
+        for i, ln in enumerate(lines):
+            low = ln.lower()
+            if (
+                "recommended international nonproprietary name" in low
+                or "inn" in low
+            ):
+                if ":" in ln:
+                    tail = ln.split(":", 1)[1].strip()
+                    if tail:
+                        return tail
+                if i + 1 < len(lines):
+                    return lines[i + 1].strip()
+        return ""
+
+    @staticmethod
+    def _extract_manufacturer_name(text: str) -> str:
+        if not text:
+            return ""
+        m = re.search(r"\bby\s+([^\.;]{5,160})", text, flags=re.IGNORECASE)
+        if m:
+            return m.group(1).strip()
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        for ln in lines:
+            low = ln.lower()
+            if "pharmaceutical" in low and ("co" in low or "ltd" in low):
+                return ln
+        return ""
+
+    def _derive_name_mfr_line(
+        self,
+        mapper: SectionMapper,
+        extractor: PdfSectionExtractor,
+    ) -> str:
+        try:
+            s11 = extractor.extract(mapper.resolve("3.2.S.1.1")).raw_text
+            s21 = extractor.extract(mapper.resolve("3.2.S.2.1")).raw_text
+        except Exception:
+            return ""
+
+        def _clean(val: str) -> str:
+            if not val:
+                return ""
+            compact = re.sub(r"\s+", " ", val).strip()
+            compact = re.sub(r"\s+,", ",", compact)
+            compact = re.sub(r"[\s\.]+$", "", compact)
+            return compact
+
+        product = _clean(self._extract_product_name(s11))
+        manufacturer = _clean(self._extract_manufacturer_name(s21))
+
+        if product and manufacturer:
+            return f"({product}, {manufacturer})"
+        if product:
+            return f"({product})"
+        if manufacturer:
+            return f"({manufacturer})"
+        return ""
 
     def run(self) -> "PipelineResult":
         spec = self.SECTION_SPECS.get(self.section)
@@ -165,9 +255,13 @@ class QosPipeline:
             self.config.image_artifacts_dir,
             diagram_cfg=self.config.diagram,
             noise_cfg=self.config.noise,
+            preserve_keywords=self.config.s2_fill.restricted_phrase_keywords,
         )
 
+        name_mfr_line = self._derive_name_mfr_line(mapper, extractor)
         filler = spec.filler_factory(self.config)
+        if name_mfr_line:
+            setattr(filler, "_name_mfr_line", name_mfr_line)
         verifier = SectionVerifier()
 
         extracted_payload: dict[str, ExtractedSectionContent] = {}
@@ -222,7 +316,7 @@ class PipelineResult:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    valid_sections = ["s1", "s2", "s3", "s32", "s4", "s5", "s6", "s7", "all"]
+    valid_sections = ["s1", "s2", "s3", "s32", "s4", "s5", "s6", "s7", "p1", "all"]
     parser = argparse.ArgumentParser(description="Generate QOS sections from dossier PDFs")
     parser.add_argument("--config", default="config.yaml", help="Path to YAML config")
     parser.add_argument("--template", default=None, help="QOS template DOCX path")

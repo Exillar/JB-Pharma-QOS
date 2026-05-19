@@ -21,12 +21,19 @@ Thumbs.db
 
 # Local tooling/config
 .claude/
+.agents/
+skills-lock.json
+
+# Local config (has absolute machine-specific paths)
+config.yaml
 
 # Local docs/scripts not needed in VCS
 QOS.MD
 _patch.py
+QOS.csv
 
 # Local nested project clone
 JB-Pharma-QIS/
 
-*.yaml
+# Dossier data — sensitive pharma documents, never commit
+Cardiolek/

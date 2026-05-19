@@ -39,11 +39,14 @@ class GenericSectionFiller(_DocxHelper):
         section_start: str,
         section_end: str,
         filled_reference_docx: Path | None = None,
+        *,
+        preserve_repeated_patterns: tuple[str, ...] = (),
     ) -> None:
         self.template_docx = template_docx
         self.SECTION_START = section_start
         self.SECTION_END = section_end
         self.filled_reference_docx = filled_reference_docx
+        self._preserve_repeated_patterns = preserve_repeated_patterns
 
     # ------------------------------------------------------------------
     # Placeholder scanning
@@ -278,8 +281,13 @@ class GenericSectionFiller(_DocxHelper):
                 doc, target_para, content, section_id, warnings
             )
 
+        preserve_patterns = tuple(self._preserve_repeated_patterns)
+        if name_line:
+            preserve_patterns = preserve_patterns + (name_line,)
         cleanup_stats = run_artifact_cleanup(
-            doc, keep_first_n_tables=template_table_count
+            doc,
+            keep_first_n_tables=template_table_count,
+            preserve_repeated_patterns=preserve_patterns,
         )
         if any(cleanup_stats.values()):
             warnings.append(f"cleanup: {cleanup_stats}")

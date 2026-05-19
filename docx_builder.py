@@ -11,6 +11,7 @@ from builders.s2 import S2DocxFiller  # noqa: F401
 from builders.s3 import S3DocxFiller  # noqa: F401
 from builders.s32 import S32DocxFiller  # noqa: F401
 from builders.s4 import S4DocxFiller  # noqa: F401
+from builders.s5 import S5DocxFiller  # noqa: F401
 from builders.generic import GenericSectionFiller  # noqa: F401
 from builders.base import _DocxHelper, run_artifact_cleanup  # noqa: F401
 
@@ -21,6 +22,7 @@ __all__ = [
     "S3DocxFiller",
     "S32DocxFiller",
     "S4DocxFiller",
+    "S5DocxFiller",
     "GenericSectionFiller",
     "_DocxHelper",
     "run_artifact_cleanup",
